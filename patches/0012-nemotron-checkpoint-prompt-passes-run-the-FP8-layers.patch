@@ -1,0 +1,213 @@
+From 90bf7f1b336acaa6d84f280d126fff719ebe5f69 Mon Sep 17 00:00:00 2001
+From: plotarmordev <299844489+plotarmordev@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 03:15:22 +0800
+Subject: [PATCH 12/18] nemotron: checkpoint prompt passes run the FP8 layers
+ in 128-row tiles
+
+ck.lane8 took its widest FP8 tile at 64 rows by 64 columns. Calls of 128 rows or more now take tf_ck8_128 (128 rows by
+64 columns) or, where K slices meet in a cluster, tf_ck8_128c (128 by 128): eight warps in two rows of 64, up to
+64 KiB of shared memory. Each row keeps its K slices, MMA steps and summation order, so its bits are the decode tiles'.
+`tf-cuda-test checkpoint` compares 129-row calls with the same rows one at a time at three shapes.
+---
+ docs/recipes/nemotron-3.5-super-vl.md |  4 +++
+ zig/kernels/cuda/ck_lane.cu           | 26 +++++++-------
+ zig/src/cuda/ck.zig                   | 19 +++++-----
+ zig/tests/cuda/ck_tests.zig           | 50 +++++++++++++++++++++++++++
+ zig/tests/cuda/main.zig               |  3 ++
+ 5 files changed, 82 insertions(+), 20 deletions(-)
+ create mode 100644 zig/tests/cuda/ck_tests.zig
+
+diff --git a/docs/recipes/nemotron-3.5-super-vl.md b/docs/recipes/nemotron-3.5-super-vl.md
+index da695ea0..cdd1ecda 100644
+--- a/docs/recipes/nemotron-3.5-super-vl.md
++++ b/docs/recipes/nemotron-3.5-super-vl.md
+@@ -92,6 +92,10 @@ On one GB10, `checkpoint` teacher-forced on `full`'s greedy 256 tokens after thr
+ decodes at about the same speed. The [quantization guide](../quantization.md#nvidias-nvfp4-checkpoints-on-cuda)
+ describes both modes. Both ranks of a two-GB10 setup must run the same precision; they check it before loading.
+ 
++Checkpoint prompt passes of 128 rows or more run the FP8 layers in 128-row tiles (128 columns where K slices meet in
++a cluster); decode keeps its narrow tiles. The per-row MMA steps, split-K summation order and output rounding are
++unchanged. `tf-cuda-test checkpoint` compares the prompt kernels with decode rows byte for byte on synthetic inputs.
++
+ ## Exactness and speed
+ 
+ Served on GB10s at a 16,384-token window, the eight release prompts at 256 tokens each, every cell held in both
+diff --git a/zig/kernels/cuda/ck_lane.cu b/zig/kernels/cuda/ck_lane.cu
+index a3f1ae10..ac1a7328 100644
+--- a/zig/kernels/cuda/ck_lane.cu
++++ b/zig/kernels/cuda/ck_lane.cu
+@@ -171,21 +171,23 @@ __device__ __forceinline__ void lane(const uint8_t* __restrict__ x, const uint8_
+ 
+ }  // namespace tf_ck
+ 
+-// The instances by tile (16, 32 or 64 rows by 64 columns; S skips m16 tiles past M) and K-slice meeting (C: cluster).
+-#define TF_CK8(NAME, BM, SKIP, CLUSTER)                                                                              \
+-    extern "C" __global__ void __launch_bounds__(128)                                                                \
++// S skips m16 tiles past M; C meets K slices in a cluster without changing their summation order.
++#define TF_CK8(NAME, BM, BN, WM, SKIP, CLUSTER)                                                                      \
++    extern "C" __global__ void __launch_bounds__(WM * 128)                                                           \
+         NAME(const uint8_t* __restrict__ x, const uint8_t* __restrict__ w, float alpha, __nv_bfloat16* __restrict__ out, \
+              float* __restrict__ part, int M, int N, int K, int SK, int group) {                                     \
+-        tf_ck::lane<tf_ck::Cfg<BM, 64, 1, 4, SKIP>, CLUSTER>(x, w, alpha, out, part, M, N, K, SK, group);           \
++        tf_ck::lane<tf_ck::Cfg<BM, BN, WM, 4, SKIP>, CLUSTER>(x, w, alpha, out, part, M, N, K, SK, group);           \
+     }
+-TF_CK8(tf_ck8_16, 16, false, false)
+-TF_CK8(tf_ck8_16c, 16, false, true)
+-TF_CK8(tf_ck8_32, 32, false, false)
+-TF_CK8(tf_ck8_32c, 32, false, true)
+-TF_CK8(tf_ck8_64, 64, false, false)
+-TF_CK8(tf_ck8_64c, 64, false, true)
+-TF_CK8(tf_ck8_64s, 64, true, false)
+-TF_CK8(tf_ck8_64sc, 64, true, true)
++TF_CK8(tf_ck8_16, 16, 64, 1, false, false)
++TF_CK8(tf_ck8_16c, 16, 64, 1, false, true)
++TF_CK8(tf_ck8_32, 32, 64, 1, false, false)
++TF_CK8(tf_ck8_32c, 32, 64, 1, false, true)
++TF_CK8(tf_ck8_64, 64, 64, 1, false, false)
++TF_CK8(tf_ck8_64c, 64, 64, 1, false, true)
++TF_CK8(tf_ck8_64s, 64, 64, 1, true, false)
++TF_CK8(tf_ck8_64sc, 64, 64, 1, true, true)
++TF_CK8(tf_ck8_128, 128, 64, 2, true, false)
++TF_CK8(tf_ck8_128c, 128, 128, 2, true, true)
+ 
+ // The slices summed in slice order, one fp32 add a slice, then the factor and one bf16 rounding.
+ extern "C" __global__ void __launch_bounds__(256)
+diff --git a/zig/src/cuda/ck.zig b/zig/src/cuda/ck.zig
+index 889451d1..17872bcf 100644
+--- a/zig/src/cuda/ck.zig
++++ b/zig/src/cuda/ck.zig
+@@ -50,7 +50,7 @@ pub const Layer = struct {
+ pub const Ck = struct {
+     lane_mod: Module,
+     experts_mod: Module,
+-    lane: [8]Function, // tiles 16, 32, 64, 64 skipping, each plain then meeting its K slices in a cluster
++    lane: [10]Function, // row tiles 16, 32, 64, 64 skipping, 128 skipping (128 x 128 clustered); plain then clustered
+     reduce: Function,
+     quant8_fn: Function,
+     quant4_fn: Function,
+@@ -70,7 +70,8 @@ pub const Ck = struct {
+         var c: Ck = undefined;
+         c.lane_mod = lane_mod;
+         c.experts_mod = experts_mod;
+-        for ([_][:0]const u8{ "tf_ck8_16", "tf_ck8_16c", "tf_ck8_32", "tf_ck8_32c", "tf_ck8_64", "tf_ck8_64c", "tf_ck8_64s", "tf_ck8_64sc" }, &c.lane) |name, *f| f.* = try lane_mod.function(name);
++        for ([_][:0]const u8{ "tf_ck8_16", "tf_ck8_16c", "tf_ck8_32", "tf_ck8_32c", "tf_ck8_64", "tf_ck8_64c", "tf_ck8_64s", "tf_ck8_64sc", "tf_ck8_128", "tf_ck8_128c" }, &c.lane) |name, *f| f.* = try lane_mod.function(name);
++        for (c.lane[8..]) |f| try f.allowDynamicShared(65536);
+         c.reduce = try lane_mod.function("tf_ck8_reduce");
+         c.quant8_fn = try lane_mod.function("tf_ck_quant8");
+         c.quant4_fn = try experts_mod.function("tf_ck_quant4");
+@@ -112,11 +113,13 @@ pub const Ck = struct {
+         const sk = qmmf.splitK(w.n, w.k);
+         const cluster = sk > 1 and sk <= 8 and c.clusters;
+         if (sk > 1 and !cluster and part == 0) return error.NeedsPartials;
+-        const bm: usize = if (m <= 16) 16 else if (m <= 32) 32 else 64;
+-        const ti: usize = if (bm == 16) 0 else if (bm == 32) 1 else if (m % 64 == 0) 2 else 3;
++        const prompt = m >= 128;
++        const bm: usize = if (prompt) 128 else if (m <= 16) 16 else if (m <= 32) 32 else 64;
++        const bn: usize = if (prompt and cluster) 128 else 64;
++        const ti: usize = if (prompt) 4 else if (bm == 16) 0 else if (bm == 32) 1 else if (m % 64 == 0) 2 else 3;
+         const f = c.lane[ti * 2 + @intFromBool(cluster)];
+-        const stage = (bm * 64 + 4096 + 127) / 128 * 128;
+-        const smem: u32 = @intCast(@max(4 * stage, if (cluster) bm * 64 * 4 else 0));
++        const stage = (bm * 64 + bn * 64 + 127) / 128 * 128;
++        const smem: u32 = @intCast(@max(4 * stage, if (cluster) bm * bn * 4 else 0));
+         const rows_t = (m + bm - 1) / bm;
+         const group = @max(1, @min(rows_t, (12 << 20) / (bm * w.k)));
+         const al = alpha(act, w.scale);
+@@ -128,8 +131,8 @@ pub const Ck = struct {
+         a.add(part);
+         for ([_]usize{ m, w.n, w.k, sk, group }) |v| a.add(@as(i32, @intCast(v)));
+         try launch_.launch(f, .{
+-            .grid = .{ .x = @intCast(rows_t * ((w.n + 63) / 64)), .y = 1, .z = sk },
+-            .block = .{ .x = 128, .y = 1, .z = 1 },
++            .grid = .{ .x = @intCast(rows_t * ((w.n + bn - 1) / bn)), .y = 1, .z = sk },
++            .block = .{ .x = if (prompt) 256 else 128, .y = 1, .z = 1 },
+             .shared = smem,
+             .cluster = if (cluster) .{ .x = 1, .y = 1, .z = sk } else null,
+         }, s, &a);
+diff --git a/zig/tests/cuda/ck_tests.zig b/zig/tests/cuda/ck_tests.zig
+new file mode 100644
+index 00000000..d25f2ce6
+--- /dev/null
++++ b/zig/tests/cuda/ck_tests.zig
+@@ -0,0 +1,50 @@
++//! Checkpoint prompt tiles against the decode MMA chains, including partial row and column tiles.
++const std = @import("std");
++const cuda = @import("cuda");
++const check = @import("check.zig");
++const Rig = @import("quant_ref_tests.zig").RigT;
++
++fn bytes(r: *Rig, n: usize, scales: bool) !u64 {
++    const host = try r.a.alloc(u8, n);
++    for (host) |*v| v.* = if (scales) 0x20 + r.rng.uintLessThan(u8, 16) else r.rng.int(u8);
++    return r.dev(host);
++}
++
++fn lane(r: *Rig, q: *const cuda.ck.Ck, n: usize, k: usize) !void {
++    const m = 129;
++    const host = try r.a.alloc(u8, m * k);
++    for (host) |*v| v.* = 0x20 + r.rng.uintLessThan(u8, 32);
++    const x = try r.dev(host);
++    const w: cuda.qmmf.Weight = .{ .mode = .fp8, .codes = try bytes(r, ((n + 63) / 64) * 64 * k, true), .scales = 0, .scale = 0.125, .n = @intCast(n), .k = @intCast(k), .npad = @intCast((n + 63) / 64 * 64) };
++    const sk = cuda.qmmf.splitK(n, k);
++    const part = try r.zeros(sk * m * n * 4);
++    const wide = try r.zeros(m * n * 2);
++    const narrow = try r.zeros(m * n * 2);
++    try q.lane8(r.s, x, m, w, 0.5, wide, part);
++    for (0..m) |row| try q.lane8(r.s, x + row * k, 1, w, 0.5, narrow + row * n * 2, part);
++    try check.sameBytes("checkpoint FP8 prompt rows", try r.back(wide, m * n * 2), try r.back(narrow, m * n * 2));
++    check.pass("checkpoint FP8: {d} rows x [{d}, {d}], {d} K slices, prompt byte-equal to rows alone", .{ m, n, k, sk });
++}
++
++pub fn run(gpu: check.Gpu) !void {
++    const major: u32 = @intCast(try gpu.ctx.attribute(.compute_capability_major));
++    if (major < 12) {
++        std.debug.print("SKIP checkpoint prompt tiles: need Blackwell FP4 MMA\n", .{});
++        return;
++    }
++    var arena: std.heap.ArenaAllocator = .init(gpu.gpa);
++    defer arena.deinit();
++    var s = try cuda.Stream.init(gpu.d, false);
++    defer s.deinit();
++    var prng = std.Random.DefaultPrng.init(0x5eed_f4f8);
++    var r: Rig = .{ .gpu = gpu, .a = arena.allocator(), .s = s, .rng = prng.random() };
++    defer {
++        for (r.bufs.items) |*b| b.free();
++        r.bufs.deinit(gpu.gpa);
++    }
++    var q = try cuda.ck.Ck.load(gpu.d, major, @intCast(try gpu.ctx.attribute(.multiprocessor_count)));
++    defer q.unload();
++    try lane(&r, &q, 192, 256);
++    try lane(&r, &q, 192, 2048);
++    try lane(&r, &q, 4096, 8192);
++}
+diff --git a/zig/tests/cuda/main.zig b/zig/tests/cuda/main.zig
+index 1d4e5f1a..dfc3d867 100644
+--- a/zig/tests/cuda/main.zig
++++ b/zig/tests/cuda/main.zig
+@@ -24,6 +24,7 @@ const glm_ref_tests = @import("glm_ref_tests.zig");
+ const carveout_tests = @import("carveout_tests.zig");
+ const nvfp4_tests = @import("nvfp4_tests.zig");
+ const modelopt_tests = @import("modelopt_tests.zig");
++const ck_tests = @import("ck_tests.zig");
+ const train_pack = @import("train_pack.zig");
+ const exlr8_tests = @import("exlr8_tests.zig");
+ const exlr8_dense_tests = @import("exlr8_dense_tests.zig");
+@@ -84,6 +85,7 @@ const usage =
+     \\  carveout [MiB] [card]     GB10 display memory: round trips and bandwidth (SKIP without the card)
+     \\  nvfp4 <dir>               NVFP4 projections against recorded lane-matmul and prompt-GEMM fixture bytes
+     \\  modelopt                  ModelOpt repack, FP8 and BF16 lane rows and relu^2 NVFP4 experts against fp64
++    \\  checkpoint                checkpoint FP8 prompt tiles byte-equal to decode rows (synthetic)
+     \\  exlr8                     EXLR8 projections: every codebook state, FP64, row windows, the Metal frozen digests
+     \\  exlr8-bench DIR [MANIFEST] [LAYER] [SETS]   a real EXLR8 layer: FP64, row windows, then GB/s by stage
+     \\  exlr8-dense [DIR]         EXLR8 dense formats: decode bit-equal, FP64, row windows; DIR adds the real matrices
+@@ -158,6 +160,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
+     if (std.mem.eql(u8, cmd, "quant-ref")) return quant_ref_tests.run(gpu);
+     if (std.mem.eql(u8, cmd, "glm-ref")) return glm_ref_tests.run(gpu);
+     if (std.mem.eql(u8, cmd, "modelopt")) return modelopt_tests.run(gpu);
++    if (std.mem.eql(u8, cmd, "checkpoint")) return ck_tests.run(gpu);
+     if (std.mem.eql(u8, cmd, "exlr8")) return exlr8_tests.run(gpu);
+     if (std.mem.eql(u8, cmd, "exlr8-dense")) return exlr8_dense_tests.run(gpu, if (rest.len > 0) rest[0] else null);
+     if (std.mem.eql(u8, cmd, "exlr8-bench")) return exlr8_tests.bench(gpu, try arg(rest, 0), if (rest.len > 1) rest[1] else "home", if (rest.len > 2) try std.fmt.parseInt(u16, rest[2], 10) else 40, if (rest.len > 3) try std.fmt.parseInt(usize, rest[3], 10) else 4);
+-- 
+2.43.0
+

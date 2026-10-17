@@ -1,0 +1,285 @@
+From 694c515a2d4723af88f31fd325553799986aca1a Mon Sep 17 00:00:00 2001
+From: plotarmordev <299844489+plotarmordev@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 01:32:07 +0800
+Subject: [PATCH 16/18] nemotron: router logits of passes over 32 rows run on
+ 128-row by 128-expert register tiles
+
+tf_nemo_router_tiles stages two 32-input steps of 128 rows and 128 experts; a thread keeps 8 rows by 8 experts in
+registers and runs every logit's fma chain over its slice in input order, so the partials keep their bits. Glue.logits
+picks the router kernel for Nano's and Super's routers alike: windows up to 16 rows keep tf_nemo_router_rows, windows of
+17 to 32 rows and unaligned rows tf_nemo_router, longer aligned passes the tiles. At Super's router (4,096 inputs,
+512 experts, 8 slices) a GB10 runs tf_nemo_router in 45-47 us at 17 to 32 rows against the tiles' 50-51 us, and in
+66 us at 40 rows, 174 us at 128 and 409 us at 300 against 51, 54 and 110 us. `tf-cuda-test glue` compares the tiles
+with tf_nemo_router and the host reference at 33 and 300 rows (4,100 against tf_nemo_router), and a 32-row window.
+---
+ docs/recipes/nemotron-3.5-super-vl.md     |  3 +
+ zig/kernels/cuda/nemotron_route.cu        | 91 +++++++++++++++++++++++
+ zig/src/families/nemotron/cuda_glue.zig   | 44 ++++++-----
+ zig/src/families/nemotron/cuda_latent.zig | 11 +--
+ zig/tests/cuda/glue_tests.zig             | 23 +++++-
+ 5 files changed, 143 insertions(+), 29 deletions(-)
+
+diff --git a/docs/recipes/nemotron-3.5-super-vl.md b/docs/recipes/nemotron-3.5-super-vl.md
+index 8487b0e1..4236a990 100644
+--- a/docs/recipes/nemotron-3.5-super-vl.md
++++ b/docs/recipes/nemotron-3.5-super-vl.md
+@@ -101,6 +101,9 @@ shares of a pair and adds them in share order before the bf16 rounding the combi
+ bf16 row a pick instead of two fp32 rows. `tf-cuda-test checkpoint` compares the prompt kernels and the combine after
+ them with the decode path byte for byte on synthetic inputs.
+ 
++Router logits of passes over 32 rows run on 128-row by 128-expert register tiles, each logit still one fma chain over
++its slice in input order; `tf-cuda-test glue` compares them with the untiled router and the host reference.
++
+ ## Exactness and speed
+ 
+ Served on GB10s at a 16,384-token window, the eight release prompts at 256 tokens each, every cell held in both
+diff --git a/zig/kernels/cuda/nemotron_route.cu b/zig/kernels/cuda/nemotron_route.cu
+index ba816347..65deea8c 100644
+--- a/zig/kernels/cuda/nemotron_route.cu
++++ b/zig/kernels/cuda/nemotron_route.cu
+@@ -38,6 +38,97 @@ extern "C" __global__ void __launch_bounds__(256) tf_nemo_router(const __nv_bflo
+ 
+ namespace {
+ 
++constexpr int TT = 128;    // rows and experts a prompt tile holds
++constexpr int TW = 16;     // words of a K step a stage holds
++constexpr int TS = TW + 4;  // a staged row's words: 16-byte copies, eight rows in a quarter warp on distinct banks
++
++__device__ __forceinline__ void cp16(uint32_t* dst, const void* src, bool read) {
++    const uint32_t at = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
++    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(at), "l"(src), "r"(read ? 16 : 0));
++}
++
++__device__ __forceinline__ uint32_t word(uint4 v, int w) { return w == 0 ? v.x : w == 1 ? v.y : w == 2 ? v.z : v.w; }
++
++// A word's low (half 0) or high bf16 as a float.
++__device__ __forceinline__ float unpack(uint32_t v, int half) {
++    return __uint_as_float(half ? v & 0xFFFF0000u : v << 16);
++}
++
++}  // namespace
++
++// Prompt passes: block (128-row tile, 128-expert block, slice) stages 16-word steps; thread (8 rows, 8 experts), each
++// output tf_nemo_router's chain. Rows and the router 16-byte aligned, the slice a whole number of steps.
++extern "C" __global__ void __launch_bounds__(256)
++tf_nemo_router_tiles(const __nv_bfloat16* __restrict__ X, const __nv_bfloat16* __restrict__ W, float* __restrict__ PART,
++                     int R, int D, int E, int SK) {
++    extern __shared__ __align__(16) uint32_t staged[];  // [2][x, w][TT][TS]
++    const int per = D / SK, steps = per / (2 * TW);
++    const int row0 = blockIdx.x * TT, e0 = blockIdx.y * TT, k0 = blockIdx.z * per;
++    const int tx = threadIdx.x % 16, ty = threadIdx.x / 16;
++    auto load = [&](int step) {
++        uint32_t* st = staged + (step & 1) * 2 * TT * TS;
++#pragma unroll
++        for (int j = 0; j < 4; ++j) {  // 2 x 128 rows of four 16-byte copies
++            const int c = threadIdx.x + 256 * j, wr = c >= 4 * TT, r = (c / 4) % TT, q = c % 4;
++            const int at = (wr ? e0 : row0) + r;
++            const bool live = at < (wr ? E : R);
++            const __nv_bfloat16* src =
++                (wr ? W : X) + static_cast<int64_t>(live ? at : 0) * D + k0 + step * 2 * TW + q * 8;
++            cp16(st + (wr * TT + r) * TS + q * 4, src, live);
++        }
++        asm volatile("cp.async.commit_group;\n" ::);
++    };
++    float acc[8][8] = {};
++    load(0);
++    for (int step = 0; step < steps; ++step) {
++        if (step + 1 < steps) {
++            load(step + 1);
++            asm volatile("cp.async.wait_group 1;\n" ::);
++        } else {
++            asm volatile("cp.async.wait_group 0;\n" ::);
++        }
++        __syncthreads();
++        const uint32_t* xs = staged + (step & 1) * 2 * TT * TS;
++        const uint32_t* ws = xs + TT * TS;
++#pragma unroll
++        for (int q = 0; q < TW / 4; ++q) {
++            uint4 xv[8], wv[8];
++#pragma unroll
++            for (int i = 0; i < 8; ++i) {
++                xv[i] = *reinterpret_cast<const uint4*>(xs + (ty + 16 * i) * TS + 4 * q);
++                wv[i] = *reinterpret_cast<const uint4*>(ws + (tx + 16 * i) * TS + 4 * q);
++            }
++#pragma unroll
++            for (int w = 0; w < 4; ++w)
++#pragma unroll
++                for (int half = 0; half < 2; ++half) {  // each word's low input, then its high one
++                    float xf[8], wf[8];
++#pragma unroll
++                    for (int i = 0; i < 8; ++i) {
++                        xf[i] = unpack(word(xv[i], w), half);
++                        wf[i] = unpack(word(wv[i], w), half);
++                    }
++#pragma unroll
++                    for (int i = 0; i < 8; ++i)
++#pragma unroll
++                        for (int j = 0; j < 8; ++j) acc[i][j] = __fmaf_rn(xf[i], wf[j], acc[i][j]);
++                }
++        }
++        __syncthreads();
++    }
++#pragma unroll
++    for (int i = 0; i < 8; ++i) {
++        const int row = row0 + ty + 16 * i;
++        if (row >= R) continue;
++#pragma unroll
++        for (int j = 0; j < 8; ++j)
++            if (e0 + tx + 16 * j < E)
++                PART[(static_cast<int64_t>(blockIdx.z) * R + row) * E + e0 + tx + 16 * j] = acc[i][j];
++    }
++}
++
++namespace {
++
+ constexpr int EB = 16;  // experts a decode block stages
+ constexpr int QB = 8;  // 16-byte loads a decode thread has in flight
+ 
+diff --git a/zig/src/families/nemotron/cuda_glue.zig b/zig/src/families/nemotron/cuda_glue.zig
+index 9db29b2f..5ea0f4ca 100644
+--- a/zig/src/families/nemotron/cuda_glue.zig
++++ b/zig/src/families/nemotron/cuda_glue.zig
+@@ -22,6 +22,7 @@ pub const Fns = struct {
+     group_rmsnorm: cuda.Function,
+     router: cuda.Function,
+     router_rows: cuda.Function,
++    router_tiles: cuda.Function,
+     topk: cuda.Function,
+     conv: cuda.Function,
+     conv_rows: cuda.Function,
+@@ -47,6 +48,7 @@ pub const Fns = struct {
+             .group_rmsnorm = try m[0].function("tf_nemo_group_rmsnorm"),
+             .router = try m[1].function("tf_nemo_router"),
+             .router_rows = try m[1].function("tf_nemo_router_rows"),
++            .router_tiles = try m[1].function("tf_nemo_router_tiles"),
+             .topk = try m[1].function("tf_nemo_topk"),
+             .conv = try m[2].function("tf_nemo_conv"),
+             .conv_rows = try m[2].function("tf_nemo_conv_rows"),
+@@ -88,10 +90,9 @@ pub const AttnSeg = struct { kc: u64, vc: u64, meta: u64, row0: usize, rows: usi
+ 
+ const AttnSegs = extern struct { kc: [max_segs]u64, vc: [max_segs]u64, meta: [max_segs]u64, row0: [max_segs]c_int, n: c_int };
+ 
+-/// The router's K slices and the shared bytes its block stages: 16 rows and 16 experts of one slice, padded a word.
+-pub fn routerShape(d: usize) struct { sk: usize, shared: u32 } {
+-    const sk = triton.divisor(d / 64, 6);
+-    return .{ .sk = sk, .shared = @intCast(2 * 16 * (d / sk / 2 + 1) * 4) };
++/// The router's K slices.
++pub fn routerShape(d: usize) struct { sk: usize } {
++    return .{ .sk = triton.divisor(d / 64, 6) };
+ }
+ 
+ /// Every launch of a window or prompt chunk's glue, on one stream.
+@@ -153,22 +154,31 @@ pub const Glue = struct {
+         try g.go(g.f.add_moe_norm, .{ rows, 1, 1 }, 1024, 0, &a);
+     }
+ 
++    /// fp32 router logits over `sk` K slices, each one fma chain in input order whichever kernel runs it.
++    pub fn logits(g: Glue, x: u64, w: u64, part: u64, rows: usize, d: usize, e: usize, sk: usize) !void {
++        const per = d / sk;
++        const aligned = (x | w) % 16 == 0;
++        var a: cuda.Args = .{};
++        ptrs(&a, &.{ x, w, part });
++        ints(&a, &.{ rows, d, e, sk });
++        // decode: a block a (16 experts, slice) stages the rows and its experts
++        if (rows <= 16 and per % 8 == 0 and aligned) {
++            const staged: u32 = @intCast((rows + 16) * (per / 8 + 1) * 16);
++            return g.go(g.f.router_rows, .{ cdiv(e, 16), sk, 1 }, 256, staged, &a);
++        }
++        // prompt: a block a (128 rows, 128 experts, slice) in two staged 32-input steps. Up to 32 rows (verify windows),
++        // two of tf_nemo_router's 16-row tiles fill the GPU better than one mostly empty 128-row tile.
++        if (rows > 32 and per % 32 == 0 and aligned) return g.go(g.f.router_tiles, .{ cdiv(rows, 128), cdiv(e, 128), sk }, 256, 2 * 2 * 128 * 20 * 4, &a);
++        try g.go(g.f.router, .{ cdiv(rows, 16), cdiv(e, 16), sk }, 256, @intCast(2 * 16 * (per / 2 + 1) * 4), &a);
++    }
++
+     /// fp32 router logits over K slices, then each row's top-k and the shared halves' slots.
+     pub fn route(g: Glue, x: u64, w: u64, bias: u64, part: u64, ids: u64, wts: u64, rows: usize, d: usize, e: usize, top_k: usize, scaling: f32, norm: bool) !void {
+         if (g.tri()) |t| return t.route(x, w, bias, part, ids, wts, rows, d, e, top_k, scaling, norm);
+         if (e > 256 or top_k + 2 > 8) return error.RouterTooWide;
+         const shape = routerShape(d);
+         if (shape.sk > 8) return error.RouterTooWide; // topk's MAXSK
+-        var a: cuda.Args = .{};
+-        ptrs(&a, &.{ x, w, part });
+-        ints(&a, &.{ rows, d, e, shape.sk });
+-        // decode: a block a (16 experts, slice) stages the rows and its experts, same bits
+-        if (rows <= 16 and d % (8 * shape.sk) == 0 and (x | w) % 16 == 0) {
+-            const staged: u32 = @intCast((rows + 16) * (d / shape.sk / 8 + 1) * 16);
+-            try g.go(g.f.router_rows, .{ cdiv(e, 16), shape.sk, 1 }, 256, staged, &a);
+-        } else {
+-            try g.go(g.f.router, .{ cdiv(rows, 16), cdiv(e, 16), shape.sk }, 256, shape.shared, &a);
+-        }
++        try g.logits(x, w, part, rows, d, e, shape.sk);
+         var b: cuda.Args = .{};
+         ptrs(&b, &.{ part, bias, ids, wts });
+         b.add(int(rows));
+@@ -358,8 +368,6 @@ pub const Glue = struct {
+     }
+ };
+ 
+-test "the router stages one slice of 16 rows and 16 experts" {
+-    const s = routerShape(2688);
+-    try std.testing.expectEqual(@as(usize, 6), s.sk);
+-    try std.testing.expectEqual(@as(u32, 2 * 16 * 225 * 4), s.shared);
++test "the router cuts 2,688 inputs into six slices" {
++    try std.testing.expectEqual(@as(usize, 6), routerShape(2688).sk);
+ }
+diff --git a/zig/src/families/nemotron/cuda_latent.zig b/zig/src/families/nemotron/cuda_latent.zig
+index f5c21008..308fe561 100644
+--- a/zig/src/families/nemotron/cuda_latent.zig
++++ b/zig/src/families/nemotron/cuda_latent.zig
+@@ -319,16 +319,7 @@ fn route(f: *const fwd.Forward, m: W.MoE, x: u64, rows: usize) !void {
+     const b = f.b;
+     const g = f.glue;
+     const sk = routerSlices(c.hidden);
+-    const per = c.hidden / sk;
+-    var a: cuda.Args = .{};
+-    for ([_]u64{ x, m.router, b.part }) |p| a.add(p);
+-    for ([_]usize{ rows, c.hidden, c.experts, sk }) |v| a.add(int(v));
+-    if (rows <= 16 and per % 8 == 0 and (x | m.router) % 16 == 0) {
+-        const staged: u32 = @intCast((rows + 16) * (per / 8 + 1) * 16);
+-        try go(g.f.router_rows, g.s, .{ (c.experts + 15) / 16, sk, 1 }, 256, staged, &a);
+-    } else {
+-        try go(g.f.router, g.s, .{ (rows + 15) / 16, (c.experts + 15) / 16, sk }, 256, @intCast(2 * 16 * (per / 2 + 1) * 4), &a);
+-    }
++    try g.logits(x, m.router, b.part, rows, c.hidden, c.experts, sk);
+     try f.ops.k.latent.?.picks(g.s, b.part, m.bias, b.pick, b.wts, rows, c.routed_scaling, c.experts, sk, c.top_k, c.ownShares(), c.norm_topk);
+ }
+ 
+diff --git a/zig/tests/cuda/glue_tests.zig b/zig/tests/cuda/glue_tests.zig
+index 843e0001..8855eaa1 100644
+--- a/zig/tests/cuda/glue_tests.zig
++++ b/zig/tests/cuda/glue_tests.zig
+@@ -189,9 +189,30 @@ fn norms(r: *Rig) !void {
+ 
+ fn route(r: *Rig) !void {
+     const sk = glue.routerShape(D).sk;
+-    // every decode window size (tf_nemo_router_rows) and a prompt chunk (tf_nemo_router)
++    // every decode window size (tf_nemo_router_rows) and a prompt chunk (tf_nemo_router_tiles)
+     for ([_]usize{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 300 }) |rows| try routeRows(r, sk, rows, 0);
+     try routeRows(r, sk, 4, 2); // a window 4 bytes off 16-byte alignment keeps tf_nemo_router
++    for ([_]usize{ 32, 33, 300, 4100 }) |rows| try superLogits(r, rows); // a 32-row window keeps tf_nemo_router
++}
++
++/// Super's router logits (4,096 inputs in 8 slices, 512 experts): prompt tiles past 32 rows against tf_nemo_router on
++/// the same rows 4 bytes off 16-byte alignment, and against the host reference up to 300 rows.
++fn superLogits(r: *Rig, rows: usize) !void {
++    const d = 4096;
++    const e = 512;
++    const sk = 8;
++    const x = try r.bfs(2 + rows * d, 1.0);
++    const w = try r.bfs(e * d, 0.05);
++    const wd = try r.dev(u16, w);
++    const tiles = try r.zeros(f32, sk * rows * e);
++    const stock = try r.zeros(f32, sk * rows * e);
++    try r.g().logits(try r.dev(u16, x[2..]), wd, tiles, rows, d, e, sk);
++    try r.g().logits(try r.dev(u16, x) + 4, wd, stock, rows, d, e, sk);
++    try r.same("Super router tiles against tf_nemo_router", f32, tiles, try r.get(f32, stock, sk * rows * e));
++    if (rows > 300) return;
++    const part = try r.a.alloc(f32, sk * rows * e);
++    ref.router(x[2..], w, part, rows, d, e, sk);
++    try r.same("Super router tiles", f32, tiles, part);
+ }
+ 
+ /// `rows` rows that start `skew` bf16 values into their buffer, routed and ranked against the host references.
+-- 
+2.43.0
+

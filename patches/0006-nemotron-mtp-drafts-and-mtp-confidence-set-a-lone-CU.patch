@@ -1,0 +1,165 @@
+From a4d812dd1e67dd122ff944afda27bfa1ee24a58f Mon Sep 17 00:00:00 2001
+From: plotarmordev <299844489+plotarmordev@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 22:00:16 +0800
+Subject: [PATCH 06/18] nemotron: --mtp-drafts and --mtp-confidence set a lone
+ CUDA stream's MTP depth
+
+The CUDA server refused both. --mtp-drafts now caps a lone stream's chain (0 serves without drafts) and
+--mtp-confidence replaces the cost rule's cut with a cumulative-confidence floor; both reach cuda_lone's depth rule,
+and copied continuations and concurrent lanes keep their policies. They are refused before device work for other
+families, past the window's drafts, or outside [0, 1]. A draft never changes a reply, only how many a round verifies.
+---
+ docs/recipes/nemotron-3.5-super-vl.md     |  6 ++++++
+ docs/recipes/nemotron-3.5.md              |  7 ++++---
+ zig/src/families/nemotron/cuda_lanes.zig  |  2 ++
+ zig/src/families/nemotron/cuda_lone.zig   |  2 ++
+ zig/src/families/nemotron/cuda_native.zig |  4 +++-
+ zig/src/native/cuda.zig                   | 10 ++++++++++
+ zig/src/native/cuda_refusal.zig           | 16 ++++++++++++++++
+ 7 files changed, 43 insertions(+), 4 deletions(-)
+
+diff --git a/docs/recipes/nemotron-3.5-super-vl.md b/docs/recipes/nemotron-3.5-super-vl.md
+index 3fe15b86..4d4a5229 100644
+--- a/docs/recipes/nemotron-3.5-super-vl.md
++++ b/docs/recipes/nemotron-3.5-super-vl.md
+@@ -25,6 +25,12 @@ The weights take 70.8 GiB of the GB10's memory (73.2 GiB with the image tower an
+ 16,384-token window the server admits 8 streams at 0.35 GiB each and keeps a prompt cache of about 8 to 10 GiB, and
+ about 24 GB of the GB10's memory stays available. Leave the other ranks' variables below unset.
+ 
++The MTP draft head uses the embedded draft vocabulary's FP8 output rows rather than the full output head.
++The target still verifies proposals with its unchanged full-vocabulary head.
++For lone drafted streams, `--mtp-drafts` caps MTP depth and `--mtp-confidence` sets a cumulative-confidence
++threshold instead of the cost-based cutoff. A zero draft cap disables drafting. Copied continuations and
++concurrent streams retain their existing lane policies.
++
+ ## Run on two GB10s
+ 
+ Rank 0 runs the whole model and serves; rank 1 holds only its share of every MoE layer's experts (the MTP layer's
+diff --git a/docs/recipes/nemotron-3.5.md b/docs/recipes/nemotron-3.5.md
+index 66119923..f0d06eb1 100644
+--- a/docs/recipes/nemotron-3.5.md
++++ b/docs/recipes/nemotron-3.5.md
+@@ -51,9 +51,10 @@ cuts, so cold and resumed prompts use the same chunks; templates without markers
+ 
+ ## CUDA
+ 
+-This section describes the Python 0.6.6 engine's CUDA family; its `--tp`, `--rank`, `--master`, `--mtp-drafts` and
+-`--prefill-fp8` flags are that engine's, and the native binary refuses them. The native CUDA build serves Nemotron on
+-one GPU, from the MLX 4-bit checkpoint or NVIDIA's NVFP4 export, with concurrent requests sharing each round; see the
++This section describes the Python 0.6.6 engine's CUDA family; its `--tp`, `--rank`, `--master` and `--prefill-fp8`
++flags are that engine's, and the native binary refuses them. The native CUDA build serves Nemotron on one GPU, from
++the MLX 4-bit checkpoint or NVIDIA's NVFP4 export, with concurrent requests sharing each round, and its own
++`--mtp-drafts` (at most 15 for this model) and `--mtp-confidence` set a lone stream's MTP drafts; see the
+ [native CUDA runbook](../../RUNBOOK.md#linux-and-cuda).
+ 
+ CUDA reads this model's MLX 4-bit checkpoint only; NVFP4 and EXL3 exports of it are not read yet. Its prompt matmuls
+diff --git a/zig/src/families/nemotron/cuda_lanes.zig b/zig/src/families/nemotron/cuda_lanes.zig
+index fa3e990c..86998374 100644
+--- a/zig/src/families/nemotron/cuda_lanes.zig
++++ b/zig/src/families/nemotron/cuda_lanes.zig
+@@ -54,6 +54,8 @@ pub const Cuda = struct {
+     cost_count: usize = 0,
+     mtp_ms: f64 = 0,
+     measured: ?core.draft_depth.Costs = null, // a lone stream's depth rule prices its rounds by these
++    mtp_drafts: ?u32 = null,
++    mtp_confidence: ?f64 = null,
+     bits: ?cuda.HostBuffer = null, // structured output's row bits, device-mapped (row_slots rows), made at first use
+     bits_dev: u64 = 0,
+     tapped: ?cuda.HostBuffer = null, // a recorder's rows on their way to the host (state.pass_rows of them)
+diff --git a/zig/src/families/nemotron/cuda_lone.zig b/zig/src/families/nemotron/cuda_lone.zig
+index f6cfe760..0ff50e0c 100644
+--- a/zig/src/families/nemotron/cuda_lone.zig
++++ b/zig/src/families/nemotron/cuda_lone.zig
+@@ -43,6 +43,8 @@ pub fn run(gpa: std.mem.Allocator, b: *Cuda, s: *lanes.Stream, hooks: Hooks) !bo
+     if (kept_rows == null) hooks.committed(hooks.ctx);
+     if (s.finished) return false;
+     var rule = drafts.depthRule(costs);
++    if (b.mtp_drafts) |most| rule.most = most;
++    rule.floor = b.mtp_confidence;
+     var r = if (kept_rows) |k|
+         try drafts.Rounds.resumed(gpa, b.e, h, &rule, s.prompt(), s.emitted(), k, s.recall)
+     else
+diff --git a/zig/src/families/nemotron/cuda_native.zig b/zig/src/families/nemotron/cuda_native.zig
+index 1f2544dd..0fbe17df 100644
+--- a/zig/src/families/nemotron/cuda_native.zig
++++ b/zig/src/families/nemotron/cuda_native.zig
+@@ -27,7 +27,7 @@ pub const default_context: i64 = engine.default_context;
+ pub const max_segments: u32 = @import("cuda_segments.zig").MAX;
+ pub const prompt_rows: u32 = state.pass_rows;
+ 
+-pub const Options = struct { context: usize, drafts: bool, segments: usize = 1, slide: bool = false, vision: ?vision.Limits = null, precision: ?@import("config.zig").Precision = null };
++pub const Options = struct { context: usize, drafts: bool, segments: usize = 1, slide: bool = false, vision: ?vision.Limits = null, precision: ?@import("config.zig").Precision = null, mtp_drafts: ?u32 = null, mtp_confidence: ?f64 = null };
+ pub const vision = @import("cuda_vision.zig");
+ 
+ /// Thinking budgets the lone driver takes (cuda_lone.zig): above it, the stream goes to the lane core before its cut.
+@@ -97,6 +97,8 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+     errdefer gpa.destroy(own);
+     own.* = .{ .gpa = gpa, .e = e, .head = head, .lanes = try Lanes.init(gpa, e, head), .target = .{ .e = e, .head = head }, .carve = carve };
+     errdefer own.lanes.deinit();
++    own.lanes.mtp_drafts = o.mtp_drafts;
++    own.lanes.mtp_confidence = o.mtp_confidence;
+     own.living = try slide.loadLiving(gpa, io, e, dir); // before the lanes' costs are measured: they decode through it
+     errdefer if (own.living) |*s| s.deinit();
+     try own.lanes.measure(io, dir);
+diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
+index 254a8799..1631c734 100644
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -21,6 +21,7 @@ const registry = .{ nemotron.native, nemotron.omni, glm.native };
+ pub const records = true;
+ 
+ pub const backends: []const []const u8 = &.{"cuda"};
++pub const serves: []const []const u8 = &.{ "--mtp-drafts", "--mtp-confidence" };
+ pub const families: []const api.Family = blk: {
+     var out: [registry.len + 1]api.Family = undefined;
+     for (registry, 0..) |F, i| out[i] = .{ .model_type = F.model_type, .formats = F.formats };
+@@ -319,6 +320,15 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+     };
+     var probe: Probe = .{ .a = a, .io = io, .ctx = &g.ctx, .held = held0, .problem = problem };
+     var opts: F.Options = .{ .context = @intCast(window), .drafts = o.drafts, .segments = segments, .slide = o.slide };
++    if (o.mtp_drafts != null or o.mtp_confidence != null) {
++        if (!@hasField(F.Options, "mtp_drafts")) {
++            problem.* = "--mtp-drafts: this CUDA family's drafts are not tunable; serve it without --mtp-drafts or --mtp-confidence";
++            return null;
++        }
++        opts.mtp_drafts = o.mtp_drafts;
++        opts.mtp_confidence = o.mtp_confidence;
++        if (o.mtp_drafts == 0) opts.drafts = false;
++    }
+     if (o.vision) |vo| {
+         if (!@hasField(F.Options, "vision")) {
+             problem.* = "--vision: this CUDA family reads no images; serve it without --vision";
+diff --git a/zig/src/native/cuda_refusal.zig b/zig/src/native/cuda_refusal.zig
+index 7cdf93f1..32816c58 100644
+--- a/zig/src/native/cuda_refusal.zig
++++ b/zig/src/native/cuda_refusal.zig
+@@ -5,6 +5,8 @@ const nemotron = @import("nemotron");
+ 
+ /// Flags refused whatever the family; null when `o` may open.
+ pub fn backend(o: api.Open) ?[]const u8 {
++    if (o.mtp_drafts) |n| if (n > 15) return "--mtp-drafts: the CUDA engine drafts at most 15";
++    if (o.mtp_confidence) |c| if (!(c >= 0 and c <= 1)) return "--mtp-confidence must be from 0 to 1";
+     if (o.learn != null and !o.learn_conversations) return "--learn learns shared prompt prefixes on Macs only; CUDA keeps conversation states on disk with --learn-conversations: serve with it, or without --learn, --learn-dir or --learn-gib";
+     if (o.speed_up != null) return "--speed-up links two Macs: serve without --speed-up on CUDA";
+     if (o.prompt_cache_over_cap) return "--prompt-cache-over-cap lifts a Mac's 70% cap: on CUDA the prompt cache takes at most the memory the weights and streams leave, so serve without it";
+@@ -68,3 +70,17 @@ test "--learn-conversations opens Nemotron only, the one CUDA family whose state
+     try std.testing.expectStringStartsWith(family(Other, .{ .dir = "d", .model_type = "m", .learn_conversations = true }) orelse "", "--learn-conversations keeps");
+     try std.testing.expect(family(nemotron.native, .{ .dir = "d", .model_type = "nemotron_h", .learn_conversations = true }) == null);
+ }
++
++test "Nemotron CUDA draft controls respect the window and probability bounds" {
++    for ([_]u32{ 0, 8, 12, 15 }) |n| {
++        try std.testing.expect(backend(.{ .dir = "d", .model_type = "nemotron_h_omni", .mtp_drafts = n }) == null);
++    }
++    try std.testing.expect(backend(.{ .dir = "d", .model_type = "nemotron_h_omni", .mtp_drafts = 16 }) != null);
++    for ([_]f64{ 0, 0.5, 1 }) |c| {
++        try std.testing.expect(backend(.{ .dir = "d", .model_type = "nemotron_h_omni", .mtp_confidence = c }) == null);
++    }
++    for ([_]f64{ -0.1, 1.1, std.math.nan(f64) }) |c| {
++        try std.testing.expect(backend(.{ .dir = "d", .model_type = "nemotron_h_omni", .mtp_confidence = c }) != null);
++    }
++    try std.testing.expect(backend(.{ .dir = "d", .model_type = "glm5_next", .mtp_drafts = 8 }) == null); // refused at its open
++}
+-- 
+2.43.0
+

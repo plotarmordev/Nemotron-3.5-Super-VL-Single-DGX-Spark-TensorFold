@@ -1,0 +1,345 @@
+From 8596061cca8e7c0e072bce9ffd230b45ac4ce2d5 Mon Sep 17 00:00:00 2001
+From: plotarmordev <299844489+plotarmordev@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 00:19:03 +0800
+Subject: [PATCH 02/18] nemotron: the checkpoint's NVFP4 experts at
+ decode-sized calls take 32 columns a warp and four steps of loads in flight,
+ same bits
+
+ck_experts.cu's grouped kernel is a template over a warp's n8 tiles and the steps of codes, scales and weights it
+keeps in registers ahead of the mma. Prompt chunks keep 8 tiles and one step; calls of up to launch.few_rows token
+rows take the _few pair, 4 tiles and 4 steps (125-128 registers, no spills). Each column still takes its 64-input
+steps in order through the same mma_fp4 and the epilogue is unchanged. Ck.down takes the call's token rows to choose.
+The modelopt test checks up and down at 1 and 16 token rows byte-equal to the same pairs inside a 40-row call.
+---
+ zig/kernels/cuda/ck_experts.cu               | 88 ++++++++++++-------
+ zig/src/cuda/ck.zig                          | 32 ++++---
+ zig/src/families/nemotron/cuda_latent_ck.zig |  4 +-
+ zig/tests/cuda/modelopt_tests.zig            | 91 ++++++++++++++++++++
+ 4 files changed, 170 insertions(+), 45 deletions(-)
+
+diff --git a/zig/kernels/cuda/ck_experts.cu b/zig/kernels/cuda/ck_experts.cu
+index ecd9653f..7d8212aa 100644
+--- a/zig/kernels/cuda/ck_experts.cu
++++ b/zig/kernels/cuda/ck_experts.cu
+@@ -71,44 +71,68 @@ extern "C" __global__ void __launch_bounds__(256)
+     dst[i] = src[(e * n + tile * 64 + c) * (ks / 16) + (k0 + g * 64) / 16 + q];
+ }
+ 
+-// A warp: a plan item's pairs (16 at most) by 64 columns; EPI 1 relu^2 of bf16(alpha_e sum) to bf16, EPI 0 fp32 sums.
+-template <int EPI>
++// One step of 64 inputs a warp reads: rows g and g + 8's codes (inputs 8t .. and 32 + 8t ..) and block scales, then
++// each n8 tile's weights and scales.
++template <int TJ>
++struct Step {
++    uint32_t a[4], sa;
++    uint2 b[TJ];
++    uint32_t s[TJ];
++};
++
++// A warp: a plan item's pairs (16 at most) by TJ n8 tiles of columns, U steps read ahead of the mma; EPI 1 relu^2 of
++// bf16(alpha_e sum) to bf16, EPI 0 fp32 sums. A column's sum takes its steps in order whatever TJ and U are.
++template <int EPI, int TJ, int U>
+ __device__ __forceinline__ void grouped(const uint8_t* __restrict__ codes, const uint8_t* __restrict__ xs, int slots,
+                                         const uint32_t* __restrict__ w, const uint8_t* __restrict__ ws,
+                                         const float* __restrict__ alpha, int K, int N, const int* __restrict__ items,
+                                         const int* __restrict__ counts, const int* __restrict__ members,
+                                         void* __restrict__ out) {
+-    const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3, NB = N / 64, KG = K / 64;
+-    const int units = __ldg(counts) * NB;
++    const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3, NG = N / (8 * TJ), KG = K / 64;
++    const int units = __ldg(counts) * NG;
+     for (int unit = blockIdx.x * 4 + (threadIdx.x >> 5); unit < units; unit += gridDim.x * 4) {
+-        const int it = unit / NB, cb = unit - it * NB;
++        const int it = unit / NG, n0 = (unit - it * NG) * 8 * TJ;
+         const int e = __ldg(items + 3 * it), first = __ldg(items + 3 * it + 1), cnt = __ldg(items + 3 * it + 2);
+         const bool v0 = g < cnt, v1 = g + 8 < cnt;
+         const int p0 = v0 ? __ldg(members + first + g) : 0, p1 = v1 ? __ldg(members + first + g + 8) : 0;
+         const int x0 = slots ? p0 / slots : p0, x1 = slots ? p1 / slots : p1;
+         const uint8_t* c0 = codes + static_cast<size_t>(x0) * (K / 2);
+         const uint8_t* c1 = codes + static_cast<size_t>(x1) * (K / 2);
+-        const uint8_t* s0 = xs + static_cast<size_t>(x0) * (K / 16);
+-        const uint8_t* s1 = xs + static_cast<size_t>(x1) * (K / 16);
+-        const size_t tile = (static_cast<size_t>(e) * NB + cb) * KG;
+-        float acc[8][4];
++        const bool hi = t & 1;  // lanes t 0 and 1 give rows g and g + 8's four block scales; t 2, 3 are not read
++        const bool vr = hi ? v1 : v0;
++        const uint8_t* sr = xs + static_cast<size_t>(hi ? x1 : x0) * (K / 16);
++        const size_t tile = (static_cast<size_t>(e) * (N / 64) + n0 / 64) * KG;  // the 64-column tile holding n0
++        const uint2* wb = reinterpret_cast<const uint2*>(w) + tile * 256 + n0 % 64 / 8 * 32 + lane;
++        const uint32_t* sw = reinterpret_cast<const uint32_t*>(ws) + tile * 64 + n0 % 64 + g;
++        auto fetch = [&](int kg, Step<TJ>& f) {  // rows past cnt: zeros
++            f.a[0] = v0 ? __ldg(reinterpret_cast<const uint32_t*>(c0 + kg * 32 + 4 * t)) : 0u;
++            f.a[1] = v1 ? __ldg(reinterpret_cast<const uint32_t*>(c1 + kg * 32 + 4 * t)) : 0u;
++            f.a[2] = v0 ? __ldg(reinterpret_cast<const uint32_t*>(c0 + kg * 32 + 16 + 4 * t)) : 0u;
++            f.a[3] = v1 ? __ldg(reinterpret_cast<const uint32_t*>(c1 + kg * 32 + 16 + 4 * t)) : 0u;
++            f.sa = vr ? __ldg(reinterpret_cast<const uint32_t*>(sr + kg * 4)) : 0u;
++#pragma unroll
++            for (int j = 0; j < TJ; ++j) {
++                f.b[j] = __ldg(wb + kg * 256 + j * 32);
++                f.s[j] = __ldg(sw + kg * 64 + j * 8);
++            }
++        };
++        float acc[TJ][4];
++#pragma unroll
++        for (int j = 0; j < TJ; ++j) acc[j][0] = acc[j][1] = acc[j][2] = acc[j][3] = 0.0f;
++        Step<TJ> st[U];
++#pragma unroll
++        for (int u = 0; u < U - 1; ++u)
++            if (u < KG) fetch(u, st[u]);
++        for (int k0 = 0; k0 < KG; k0 += U) {
++            // step k0 + u's slot is u: indices known at compile time keep st in registers
+ #pragma unroll
+-        for (int j = 0; j < 8; ++j) acc[j][0] = acc[j][1] = acc[j][2] = acc[j][3] = 0.0f;
+-        for (int kg = 0; kg < KG; ++kg) {
+-            uint32_t a[4];  // rows g and g + 8, inputs 8t .. and 32 + 8t .. of this step (rows past cnt: zeros)
+-            a[0] = v0 ? __ldg(reinterpret_cast<const uint32_t*>(c0 + kg * 32 + 4 * t)) : 0u;
+-            a[1] = v1 ? __ldg(reinterpret_cast<const uint32_t*>(c1 + kg * 32 + 4 * t)) : 0u;
+-            a[2] = v0 ? __ldg(reinterpret_cast<const uint32_t*>(c0 + kg * 32 + 16 + 4 * t)) : 0u;
+-            a[3] = v1 ? __ldg(reinterpret_cast<const uint32_t*>(c1 + kg * 32 + 16 + 4 * t)) : 0u;
+-            const bool hi = t & 1;  // lanes t 0 and 1 give rows g and g + 8's four block scales; t 2, 3 are not read
+-            const bool vr = hi ? v1 : v0;
+-            const uint32_t sa = vr ? __ldg(reinterpret_cast<const uint32_t*>((hi ? s1 : s0) + kg * 4)) : 0u;
+-            const uint2* wb = reinterpret_cast<const uint2*>(w) + (tile + kg) * 256;
+-            const uint32_t* sw = reinterpret_cast<const uint32_t*>(ws) + (tile + kg) * 64;
++            for (int u = 0; u < U; ++u) {
++                const int kg = k0 + u;
++                if (kg + U - 1 < KG) fetch(kg + U - 1, st[(u + U - 1) % U]);
++                if (kg < KG)
+ #pragma unroll
+-            for (int j = 0; j < 8; ++j) {
+-                const uint2 b = __ldg(wb + j * 32 + lane);
+-                mma4::mma_fp4(acc[j], a, b.x, b.y, sa, __ldg(sw + j * 8 + g));
++                    for (int j = 0; j < TJ; ++j)
++                        mma4::mma_fp4(acc[j], st[u].a, st[u].b[j].x, st[u].b[j].y, st[u].sa, st[u].s[j]);
+             }
+         }
+         const float al = __ldg(alpha + e);
+@@ -117,8 +141,8 @@ __device__ __forceinline__ void grouped(const uint8_t* __restrict__ codes, const
+             if (!(h ? v1 : v0)) continue;
+             const size_t row = static_cast<size_t>(h ? p1 : p0) * N;
+ #pragma unroll
+-            for (int j = 0; j < 8; ++j) {
+-                const int col = cb * 64 + j * 8 + 2 * t;
++            for (int j = 0; j < TJ; ++j) {
++                const int col = n0 + j * 8 + 2 * t;
+                 const float a0 = acc[j][2 * h] * al, a1 = acc[j][2 * h + 1] * al;
+                 if constexpr (EPI == 0) {
+                     *reinterpret_cast<float2*>(reinterpret_cast<float*>(out) + row + col) = make_float2(a0, a1);
+@@ -132,13 +156,17 @@ __device__ __forceinline__ void grouped(const uint8_t* __restrict__ codes, const
+     }
+ }
+ 
+-#define TF_CK4(NAME, EPI)                                                                                              \
++#define TF_CK4(NAME, EPI, TJ, U)                                                                                       \
+     extern "C" __global__ void __launch_bounds__(128)                                                                  \
+         NAME(const uint8_t* __restrict__ codes, const uint8_t* __restrict__ xs, int slots,                            \
+              const uint32_t* __restrict__ w, const uint8_t* __restrict__ ws, const float* __restrict__ alpha, int K,  \
+              int N, const int* __restrict__ items, const int* __restrict__ counts, const int* __restrict__ members,   \
+              void* __restrict__ out) {                                                                                 \
+-        grouped<EPI>(codes, xs, slots, w, ws, alpha, K, N, items, counts, members, out);                              \
++        grouped<EPI, TJ, U>(codes, xs, slots, w, ws, alpha, K, N, items, counts, members, out);                       \
+     }
+-TF_CK4(tf_ck4_up_relu2, 1)
+-TF_CK4(tf_ck4_down_f32, 0)
++// Prompt chunks: 64 columns a warp, a step at a time. Decode-sized calls: 32 columns a warp (twice the warps, which the
++// shared expert's two items need) and four steps in flight (the loads stream under the mma); same bits.
++TF_CK4(tf_ck4_up_relu2, 1, 8, 1)
++TF_CK4(tf_ck4_down_f32, 0, 8, 1)
++TF_CK4(tf_ck4_up_relu2_few, 1, 4, 4)
++TF_CK4(tf_ck4_down_f32_few, 0, 4, 4)
+diff --git a/zig/src/cuda/ck.zig b/zig/src/cuda/ck.zig
+index d336754e..6ab3369d 100644
+--- a/zig/src/cuda/ck.zig
++++ b/zig/src/cuda/ck.zig
+@@ -53,9 +53,9 @@ pub const Ck = struct {
+     quant4_fn: Function,
+     pack4_fn: Function,
+     pack4_scales_fn: Function,
+-    up_fn: Function,
+-    down_fn: Function,
+-    resident: [2]usize, // blocks the up and down kernels fill: per SM times SMs
++    up_fns: [2]Function, // prompt chunks, then decode-sized calls (ck_experts.cu's _few: 32 columns a warp)
++    down_fns: [2]Function,
++    resident: [2][2]usize, // blocks the up and down kernels fill, by up_fns' order: per SM times SMs
+     clusters: bool,
+ 
+     pub fn load(d: *const Driver, capability_major: u32, sms: usize) !Ck {
+@@ -73,9 +73,11 @@ pub const Ck = struct {
+         c.quant4_fn = try experts_mod.function("tf_ck_quant4");
+         c.pack4_fn = try experts_mod.function("tf_ck_pack4");
+         c.pack4_scales_fn = try experts_mod.function("tf_ck_pack4_scales");
+-        c.up_fn = try experts_mod.function("tf_ck4_up_relu2");
+-        c.down_fn = try experts_mod.function("tf_ck4_down_f32");
+-        c.resident = .{ @max(1, try c.up_fn.occupancy(128, 0)) * sms, @max(1, try c.down_fn.occupancy(128, 0)) * sms };
++        for ([_][2][:0]const u8{ .{ "tf_ck4_up_relu2", "tf_ck4_down_f32" }, .{ "tf_ck4_up_relu2_few", "tf_ck4_down_f32_few" } }, 0..) |names, i| {
++            c.up_fns[i] = try experts_mod.function(names[0]);
++            c.down_fns[i] = try experts_mod.function(names[1]);
++            c.resident[i] = .{ @max(1, try c.up_fns[i].occupancy(128, 0)) * sms, @max(1, try c.down_fns[i].occupancy(128, 0)) * sms };
++        }
+         c.clusters = capability_major >= 9;
+         return c;
+     }
+@@ -175,19 +177,23 @@ pub const Ck = struct {
+         return .{ count * n * k / 2, count * n * (k / 16) };
+     }
+ 
++    /// Columns of `n` a warp of the up and down kernels takes, by up_fns' order.
++    const warp_columns = [2]usize{ 64, 32 };
++
+     /// relu^2 up over a plan: NVFP4 rows (quant4's, at `rows`, `k` wide; row = pair / slots) to bf16 [pairs][width].
+     pub fn up(c: *const Ck, s: Stream, l: Layer, rows: u64, nrows: usize, slots: usize, p: Plan, out: u64, items: usize) !void {
+-        return c.run(s, c.up_fn, c.resident[0], rows, nrows, slots, l.up, l.up_s, l.up_alpha, l.dims, l.width, p, out, items);
++        const few = @intFromBool(nrows <= launch_.few_rows);
++        return run(s, c.up_fns[few], c.resident[few][0], warp_columns[few], rows, nrows, slots, l.up, l.up_s, l.up_alpha, l.dims, l.width, p, out, items);
+     }
+ 
+-    /// down over a plan: NVFP4 pair rows (quant4's, at `rows`) to fp32 [pairs][dims].
+-    pub fn down(c: *const Ck, s: Stream, l: Layer, rows: u64, nrows: usize, p: Plan, out: u64, items: usize) !void {
+-        return c.run(s, c.down_fn, c.resident[1], rows, nrows, 0, l.down, l.down_s, l.down_alpha, l.width, l.dims, p, out, items);
++    /// down over a plan: NVFP4 pair rows (quant4's, at `rows`) of `tokens` token rows to fp32 [pairs][dims].
++    pub fn down(c: *const Ck, s: Stream, l: Layer, rows: u64, nrows: usize, tokens: usize, p: Plan, out: u64, items: usize) !void {
++        const few = @intFromBool(tokens <= launch_.few_rows);
++        return run(s, c.down_fns[few], c.resident[few][1], warp_columns[few], rows, nrows, 0, l.down, l.down_s, l.down_alpha, l.width, l.dims, p, out, items);
+     }
+ 
+-    fn run(c: *const Ck, s: Stream, f: Function, resident: usize, rows: u64, nrows: usize, slots: usize, w: u64, ws: u64, al: u64, k: usize, n: usize, p: Plan, out: u64, items: usize) !void {
+-        _ = c;
+-        const nb = n / 64;
++    fn run(s: Stream, f: Function, resident: usize, columns: usize, rows: u64, nrows: usize, slots: usize, w: u64, ws: u64, al: u64, k: usize, n: usize, p: Plan, out: u64, items: usize) !void {
++        const nb = n / columns;
+         const grid = @min((items * nb + 3) / 4, resident);
+         if (grid < 1) return;
+         var a: launch_.Args = .{};
+diff --git a/zig/src/families/nemotron/cuda_latent_ck.zig b/zig/src/families/nemotron/cuda_latent_ck.zig
+index f7dceaa6..d6384e9e 100644
+--- a/zig/src/families/nemotron/cuda_latent_ck.zig
++++ b/zig/src/families/nemotron/cuda_latent_ck.zig
+@@ -61,14 +61,14 @@ pub fn partials(o: kern.Ops, t: Tables, plan: kern.Plan, act: u64, sact: u64, si
+     const items = kern.maxItems(pairs, r.experts, 16);
+     try q.up(o.s, r, at.lat, rows, c.top_k * own, plan, act, items);
+     try q.quant4(o.s, act, r.width, pairs, r.width, r.down_act, at.act);
+-    try q.down(o.s, r, at.act, pairs, plan, out, items);
++    try q.down(o.s, r, at.act, pairs, rows, plan, out, items);
+     const h = t.shared;
+     try q.quant4(o.s, hidden, c.hidden, rows, c.hidden, h.up_act, at.hid);
+     try o.plan(sids, rows * own, own, 16, plan);
+     const sh_items = kern.maxItems(rows * own, own, 16);
+     try q.up(o.s, h, at.hid, rows, own, plan, sact, sh_items);
+     try q.quant4(o.s, sact, h.width, rows * own, h.width, h.down_act, at.sact);
+-    try q.down(o.s, h, at.sact, rows * own, plan, out + @as(u64, pairs) * c.latent * 4, sh_items);
++    try q.down(o.s, h, at.sact, rows * own, rows, plan, out + @as(u64, pairs) * c.latent * 4, sh_items);
+ }
+ 
+ test "a pass's NVFP4 rows" {
+diff --git a/zig/tests/cuda/modelopt_tests.zig b/zig/tests/cuda/modelopt_tests.zig
+index 1e9f5162..142945b0 100644
+--- a/zig/tests/cuda/modelopt_tests.zig
++++ b/zig/tests/cuda/modelopt_tests.zig
+@@ -69,6 +69,11 @@ pub fn run(gpu: Gpu) !void {
+     const lin: cuda.qlinear.Linear = .{ .lane = &lane, .nvfp4_prompt = &gemm };
+     for ([_]qmmf.Mode{ .fp8, .bf16 }) |mode| try lanes(gpu, rng, &pack, lin, stream, mode);
+     try experts(gpu, rng, &pack, stream);
++    if (capability / 10 < 12) {
++        std.debug.print("SKIP modelopt checkpoint experts: the block-scaled FP4 mma needs sm_120a\n", .{});
++        return;
++    }
++    try checkpointExperts(gpu, rng, stream, capability / 10);
+ }
+ 
+ /// Every GPU repack byte-equal to its host twin.
+@@ -343,6 +348,92 @@ fn experts(gpu: Gpu, rng: std.Random, p: *const modelopt.Packer, s: cuda.Stream)
+     check.pass("nvfp4 relu^2 experts: rms error / rms(fp64) up {e:.3} (decode {e:.3}), down {e:.3} (decode {e:.3}); 13-row launch bytes == 40-row", .{ rel[1][0], rel[0][0], rel[1][1], rel[0][1] });
+ }
+ 
++/// The checkpoint math's NVFP4 experts (cuda/ck.zig): each decode-sized call (1 and 16 token rows, ck_experts.cu's _few
++/// kernels) byte-equal to the same rows' pairs inside a 40-row call (the prompt kernels).
++fn checkpointExperts(gpu: Gpu, rng: std.Random, s: cuda.Stream, major: u32) !void {
++    const a = gpu.gpa;
++    const e = 6;
++    const width = 320;
++    const dims = 256;
++    const rows = 40;
++    const slots = 2;
++    const pairs = rows * slots;
++    const sms: usize = @intCast(try gpu.ctx.attribute(.multiprocessor_count));
++    var ck = try cuda.ck.Ck.load(gpu.d, major, sms);
++    defer ck.unload();
++    var w: [2][2]cuda.DeviceBuffer = undefined; // up, down: words, scale tiles
++    var made: usize = 0;
++    defer for (w[0..made]) |*d| for (d) |*b| b.free();
++    for (0..2) |i| {
++        const n: usize = if (i == 0) width else dims;
++        const k: usize = if (i == 0) dims else width;
++        const codes = try a.alloc(u8, e * n * k / 2);
++        defer a.free(codes);
++        const scales = try a.alloc(u8, e * n * k / 16);
++        defer a.free(scales);
++        fill(rng, codes, .any);
++        fill(rng, scales, .scale);
++        var dc = try dev(gpu, codes);
++        defer dc.free();
++        var ds = try dev(gpu, scales);
++        defer ds.free();
++        const bytes = cuda.ck.Ck.packedBytes(e, n, k);
++        w[i] = .{ try cuda.DeviceBuffer.alloc(gpu.d, bytes[0]), try cuda.DeviceBuffer.alloc(gpu.d, bytes[1]) };
++        made += 1;
++        try ck.pack(s, dc.ptr, ds.ptr, e, n, k, 0, k, w[i][0].ptr, w[i][1].ptr);
++    }
++    var alphas: [2 * e]f32 = undefined;
++    for (&alphas) |*x| x.* = 0.005 + rng.float(f32) * 0.03;
++    var dal = try dev(gpu, std.mem.sliceAsBytes(&alphas));
++    defer dal.free();
++    const l: cuda.ck.Layer = .{ .up = w[0][0].ptr, .up_s = w[0][1].ptr, .down = w[1][0].ptr, .down_s = w[1][1].ptr, .up_alpha = dal.ptr, .down_alpha = dal.ptr + e * 4, .up_act = 0.05, .down_act = 0.5, .experts = e, .width = width, .dims = dims };
++    var picks: [pairs]i32 = undefined;
++    for (&picks) |*k| k.* = @intCast(rng.uintLessThan(u32, e));
++    const x = try bf16s(a, rng, rows * dims, 4);
++    defer a.free(x);
++    var mod = try cuda.Module.load(gpu.d, cuda.kernels.experts);
++    defer mod.unload();
++    const router = try cuda.grouped.Router.resolve(mod);
++    var bufs: [5]cuda.DeviceBuffer = undefined;
++    for (&bufs, [5]usize{ pairs * 4, cuda.grouped.maxItems(pairs, e, 16) * 12, 8, 4, 4 }) |*b, n| b.* = try cuda.DeviceBuffer.alloc(gpu.d, n);
++    defer for (&bufs) |*b| b.free();
++    const plan: cuda.grouped.Plan = .{ .members = bufs[0].ptr, .items = bufs[1].ptr, .counts = bufs[2].ptr, .rank = bufs[3].ptr, .hist = bufs[4].ptr };
++    var dp = try dev(gpu, std.mem.sliceAsBytes(&picks));
++    defer dp.free();
++    var dx = try dev(gpu, std.mem.sliceAsBytes(x));
++    defer dx.free();
++    var xq = try cuda.DeviceBuffer.alloc(gpu.d, cuda.ck.rowsBytes(rows, dims));
++    defer xq.free();
++    var act = try cuda.DeviceBuffer.alloc(gpu.d, pairs * width * 2);
++    defer act.free();
++    var aq = try cuda.DeviceBuffer.alloc(gpu.d, cuda.ck.rowsBytes(pairs, width));
++    defer aq.free();
++    var y = try cuda.DeviceBuffer.alloc(gpu.d, pairs * dims * 4);
++    defer y.free();
++    var outs: [3][2][]u8 = undefined; // 40 rows (prompt kernels), then 1 and 16 (decode-sized): act, y
++    var got: usize = 0;
++    defer for (outs[0..got]) |o| for (o) |b| a.free(b);
++    for ([3]usize{ rows, 1, 16 }) |nrows| {
++        const np = nrows * slots;
++        try router.route(s, dp.ptr, np, e, 16, plan);
++        const items = cuda.grouped.maxItems(np, e, 16);
++        try act.fill8(0xff, s.handle);
++        try y.fill8(0xff, s.handle);
++        try ck.quant4(s, dx.ptr, dims, nrows, dims, l.up_act, xq.ptr);
++        try ck.up(s, l, xq.ptr, nrows, slots, plan, act.ptr, items);
++        try ck.quant4(s, act.ptr, width, np, width, l.down_act, aq.ptr);
++        try ck.down(s, l, aq.ptr, np, nrows, plan, y.ptr, items);
++        try s.synchronize();
++        outs[got] = .{ try check.download(gpu, act), try check.download(gpu, y) };
++        got += 1;
++    }
++    for (outs[1..], [2]usize{ 1, 16 }) |o, nrows| {
++        try check.sameBytes("checkpoint up, decode-sized against 40 rows", o[0][0 .. nrows * slots * width * 2], outs[0][0][0 .. nrows * slots * width * 2]);
++        try check.sameBytes("checkpoint down, decode-sized against 40 rows", o[1][0 .. nrows * slots * dims * 4], outs[0][1][0 .. nrows * slots * dims * 4]);
++    }
++    check.pass("checkpoint nvfp4 experts: 1 and 16 token rows (32 columns a warp, four steps in flight) byte-equal to the same pairs in a 40-row call (64 columns a warp)", .{});
++}
++
+ /// Weight [r, c] of expert `x` of [n, k] NVFP4 matrices: e2m1 code times its e4m3 block scale.
+ fn weight(codes: []const u8, scales: []const u8, x: usize, n: usize, k: usize, r: usize, c: usize) f64 {
+     const byte = codes[(x * n + r) * (k / 2) + c / 2];
+-- 
+2.43.0
+

@@ -1,0 +1,35 @@
+From e6b5fc2bc6400b110b507689a0f2a03c7493f352 Mon Sep 17 00:00:00 2001
+From: plotarmordev <299844489+plotarmordev@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 09:36:05 +0800
+Subject: [PATCH 18/18] CHANGELOG: Super VL's faster decode and checkpoint
+ prompts on one GB10, --mtp-* on CUDA, and their memory
+
+One line each under Unreleased for the decode work (the FP8 draft-vocabulary head and the per-stream head choice,
+32-row windows, the copy floor, the side stream and the top-k and decode-sized expert kernels), the native CUDA
+--mtp-drafts and --mtp-confidence, the checkpoint prompt tiles, and the weights and stream memory against 1.0.12's.
+The figures are the paired run against 1.0.12 built from source on one GB10, as the recipe gives them.
+---
+ CHANGELOG.md | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index c826b153..fb3f5389 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -2,6 +2,13 @@
+ 
+ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 release notes](RELEASE-NOTES-1.0.0.md) for the native binary's supported models and migration details.
+ 
++## Unreleased
++
++- Nemotron 3.5 Super VL decodes faster on one GB10. Its MTP head drafts over the checkpoint's embedded draft vocabulary from that vocabulary's own FP8 output rows, and a stream whose last 16 context tokens (its prompt's tail at first) are not all draft ids drafts on the whole head, which stays loaded; the target still verifies every draft with its whole head. Super verifies windows of up to 32 rows (31 drafts a round), a lone stream's copied and Recall chains start at 15 tokens and grow with what copies keep, the shared expert runs on a second stream beside the routed experts, and the latent top-k and the decode-sized NVFP4 experts run faster kernels with every output's sums in their order. On a GB10 against 1.0.12, every reply was the same tokens (counting and seven language prompts with `"draft": false` too), and concurrent streams equalled their solo runs; drafted decode was 22.2% faster counting to 1,000, 17.9% on a short story, 17.1% on code, 20.0% describing an image and 10.9% to 18.5% in six languages, `"draft": false` 16.0% faster, and 8 concurrent streams 27.5% faster together.
++- On CUDA, `--mtp-drafts` and `--mtp-confidence` set a lone Nemotron stream's MTP depth; the native CUDA server refused both. `--mtp-drafts` caps the chain (0 serves without drafts; at most 31 on Super VL and 15 on Nemotron 3.5 Lightning, each refusing more when it opens) and `--mtp-confidence` cuts it at a cumulative confidence from 0 to 1 in place of the cost rule. Copied continuations and concurrent streams keep their policies, other families refuse both, and a reply never changes, only how many drafts a round verifies.
++- Super VL's cold prompts in `checkpoint` precision read faster on one GB10. The FP8 layers run in 128-row tiles, the NVFP4 experts in 128-pair by 128-column tiles whose up kernel writes down's NVFP4 rows and whose down kernel adds both width shares into bf16 on one GPU, and router logits of passes over 32 rows on 128-row by 128-expert register tiles, every output with the decode path's sums in their order (`tf-cuda-test checkpoint` and `glue` compare them byte for byte). On a GB10, cold prompts of 2,048, 8,192 and 16,384 tokens took 0.905, 3.078 and 8.958 s against 1.0.12's 1.216, 4.447 and 13.254 s, with 1.0.12's tokens; each 16,384-token prompt waited 4 to 6 s at the heat gate in both.
++- Super VL takes 72.93 GiB on a GB10 with the image tower, against 1.0.12's 73.16 GiB, and 0.40 GiB a stream against 0.35 GiB at the default window; at `--context 131072` a GB10 admits 8 streams at 1.39 GiB each and a 16 GiB prompt cache.
++
+ ## 1.0.12
+ 
+ - Nemotron serves MLX checkpoints with a width per module on Metal: TensorFold's oQ4, oQ6 and oQ8 quants, and any MLX affine checkpoint at 2 to 8 bits (not 7) in groups of 32, 64 or 128. 1.0.11 refused every one of them at `config.json` ("the native Nemotron kernels read every matrix at the checkpoint's 4-bit in groups of 64"), and refused a uniform 8-bit checkpoint with a reason about its shapes. A matrix at 4-bit in groups of 64 runs on the kernels it ran on before. In decode, every other width runs on the shared row kernels. Prompt chunks past 128 rows run the other dense matrices on simd_qmm_bits' tiles where their groups are 64, and the routed experts on Flash Next's width-general expert gathers, compiled at load for each width the checkpoint uses. The embedding has a lookup for any width, a mixed q/k/v stack runs member by member, and the routed experts run by expert id. On an M3 Ultra, oQ4, oQ6 and oQ8 each gave drafted replies equal to `"draft": false` on 17 prompts, 2 and 4 concurrent streams equal to their solo runs, and 12 resumed chat turns equal to a cache-off server's. Teacher-forced against mlx_lm's forward of the same checkpoint on 3,072 positions, their mean KL is 0.0050 to 0.0054 nats a token, with the same top token at 96.2% to 97.0% of positions; the 4-bit checkpoint gives 0.0056 and 96.2% through the same tool. Prompts of 8,192 to 32,768 tokens read at 0.96x to 0.99x mlx_lm's rate on the same checkpoint. Greedy prose decodes at 162 tok/s with oQ4, 117 with oQ6 and 111 with oQ8, against 188 with the 4-bit checkpoint, and greedy code at 249, 183 and 174 against 268. The oQ checkpoints carry no MTP head, so copy `mtp-4bit.safetensors` from the 4-bit checkpoint into the folder to draft.
+-- 
+2.43.0
+

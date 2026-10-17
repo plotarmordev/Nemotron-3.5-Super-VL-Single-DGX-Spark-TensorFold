@@ -1,0 +1,138 @@
+From 4017a185a7874483a70d06dcc16e665ab826e5f4 Mon Sep 17 00:00:00 2001
+From: plotarmordev <299844489+plotarmordev@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 21:59:00 +0800
+Subject: [PATCH 05/18] nemotron: Super's MTP head drafts over the embedded
+ draft vocabulary's FP8 output rows
+
+The draft head was the target's own, so every chain level read the whole FP8 output head. It now packs the
+checkpoint's FP8 lm_head rows for the embedded draft vocabulary into a lane weight of their own and uploads their
+vocabulary ids; a level proposes over that subset and the target still verifies every proposal with its full head, so
+replies are unchanged. A level falls from 3.55 to 2.16 ms on a GB10, for 192 MiB beside the full head.
+---
+ docs/recipes/nemotron-3.5-super-vl.md       |  3 +--
+ zig/src/families/nemotron/cuda_latent.zig   |  9 ++-----
+ zig/src/families/nemotron/cuda_modelopt.zig | 30 ++++++++++++++++-----
+ zig/src/families/nemotron/cuda_weights.zig  | 14 +++++++---
+ 4 files changed, 37 insertions(+), 19 deletions(-)
+
+diff --git a/docs/recipes/nemotron-3.5-super-vl.md b/docs/recipes/nemotron-3.5-super-vl.md
+index 25a2f01c..3fe15b86 100644
+--- a/docs/recipes/nemotron-3.5-super-vl.md
++++ b/docs/recipes/nemotron-3.5-super-vl.md
+@@ -96,8 +96,7 @@ equal their solo runs, and three-turn chats with regenerate, edit and delete equ
+ | Two GB10s | `checkpoint` (default) | 46.8 tok/s (35.9 to 63.6) | 20.2 tok/s | |
+ | Two GB10s | `full` | 48.1 tok/s (36.4 to 65.6) | 21.4 tok/s | |
+ 
+-Four concurrent greedy streams on two GB10s took 6.2 s together against 11.8 s one at a time. The MTP layer drafts
+-with the target's own output head over the whole vocabulary.
++Four concurrent greedy streams on two GB10s took 6.2 s together against 11.8 s one at a time.
+ 
+ ## Images
+ 
+diff --git a/zig/src/families/nemotron/cuda_latent.zig b/zig/src/families/nemotron/cuda_latent.zig
+index 99d146b7..8a805822 100644
+--- a/zig/src/families/nemotron/cuda_latent.zig
++++ b/zig/src/families/nemotron/cuda_latent.zig
+@@ -184,7 +184,7 @@ fn norm(L: *W.Loader, ck: *core.Checkpoint, label: []const u8, pre: []const u8,
+     return L.raw(label, try ck.expect(try std.fmt.bufPrint(&b, "{s}{s}", .{ pre, leaf }), .bf16, &.{c.hidden}));
+ }
+ 
+-/// The MTP head as stored (bf16 attention and input projection, a latent MoE); it drafts over the whole head.
++/// The MTP head as stored (bf16 attention and input projection, a latent MoE).
+ pub fn mtp(L: *W.Loader, ck: *core.Checkpoint, c: Config) !void {
+     var buf: [6][192]u8 = undefined;
+     var p: [128]u8 = undefined;
+@@ -205,12 +205,7 @@ pub fn mtp(L: *W.Loader, ck: *core.Checkpoint, c: Config) !void {
+         .moe = try load(L, ck, "mtp.moe", try at(&buf[5], pre, "1.mixer."), c, mtp_id),
+         .final_norm = try norm(L, ck, "mtp.final_norm", pre, "1.final_layernorm.weight", c),
+     };
+-    // the draft head is the target's: every id a candidate, so no vocabulary table is needed for this tokenizer
+-    L.w.draft_head = L.w.head;
+-    const ids = try L.gpa.alloc(u32, c.vocab);
+-    defer L.gpa.free(ids);
+-    for (ids, 0..) |*x, i| x.* = @intCast(i);
+-    try W.draftIds(L, ids);
++    try modelopt.fp8DraftHead(L, ck, c);
+ }
+ 
+ /// Expert `e`'s projection name: `pre` then `mid` (with its index when `mid` takes one) then the leaf.
+diff --git a/zig/src/families/nemotron/cuda_modelopt.zig b/zig/src/families/nemotron/cuda_modelopt.zig
+index c29ce2c9..c64f94bc 100644
+--- a/zig/src/families/nemotron/cuda_modelopt.zig
++++ b/zig/src/families/nemotron/cuda_modelopt.zig
+@@ -299,12 +299,8 @@ fn draftHead(L: *Loader, ck: *core.Checkpoint, c: Config) !void {
+     if (p.kind != .nvfp4 or p.n != c.vocab) return error.UnexpectedTensor;
+     const rows = [2]usize{ p.k / 2, p.k / 16 };
+     const host = try L.staging(ids.len * (rows[0] + rows[1]));
+-    for ([2]Tensor{ p.w, p.blocks.? }, rows, [2]usize{ 0, ids.len * rows[0] }) |t, row, at| {
+-        const whole = try L.gpa.alloc(u8, t.bytes.len);
+-        defer L.gpa.free(whole);
+-        try L.src.read(whole, t.bytes);
+-        for (ids, 0..) |id, r| @memcpy(host[at + r * row ..][0..row], whole[id * row ..][0..row]);
+-    }
++    try W.gatherRows(L, p.w, ids, host);
++    try W.gatherRows(L, p.blocks.?, ids, host[ids.len * rows[0] ..]);
+     const base = try L.tmp(host.len);
+     try L.ops.upload(base, host);
+     const n = ids.len;
+@@ -314,3 +310,25 @@ fn draftHead(L: *Loader, ck: *core.Checkpoint, c: Config) !void {
+     L.w.draft_head = .{ .nvfp4 = cuda.nvfp4.weight(words, tiles, p.scale, n, p.k) };
+     try W.draftIds(L, ids);
+ }
++
++/// Super's head_rows: lm_head's FP8 rows for the draft ids, packed as a head of their own (the head's scales).
++pub fn fp8DraftHead(L: *Loader, ck: *core.Checkpoint, c: Config) !void {
++    const m = try kernels(L);
++    const ids = try draft_ids.load(L.gpa, c.vocab);
++    defer L.gpa.free(ids);
++    var buf: [192]u8 = undefined;
++    const p = try part(ck, try name(&buf, "{s}lm_head", .{c.prefix()}));
++    if (p.kind != .fp8 or p.n != c.vocab or p.k != c.hidden) return error.UnexpectedTensor;
++    const act: f32 = if (L.ops.k.ck != null) p.act else 0;
++    if (L.ops.k.ck != null and act == 0) return error.NoInputScale;
++    const host = try L.staging(ids.len * p.k);
++    try W.gatherRows(L, p.w, ids, host);
++    const base = try L.tmp(host.len);
++    try L.ops.upload(base, host);
++    const out = try L.alloc("draft_head.weight", cuda.modelopt.padded(ids.len) * p.k);
++    try m.pack.fp8Lane(L.ops.s, base, out, ids.len, p.k);
++    var w = cuda.modelopt.fp8Weight(out, p.scale, ids.len, p.k);
++    w.act = act;
++    L.w.draft_head = .{ .fp8 = w };
++    try W.draftIds(L, ids);
++}
+diff --git a/zig/src/families/nemotron/cuda_weights.zig b/zig/src/families/nemotron/cuda_weights.zig
+index f27cc491..7cc69ed2 100644
+--- a/zig/src/families/nemotron/cuda_weights.zig
++++ b/zig/src/families/nemotron/cuda_weights.zig
+@@ -528,10 +528,7 @@ fn loadMtp(gpa: std.mem.Allocator, io: std.Io, L: *Loader, main: *core.Checkpoin
+     var at: usize = 0;
+     for (&parts) |*t| {
+         const row = t.bytes.len / t.dim(0);
+-        const whole = try gpa.alloc(u8, t.bytes.len);
+-        defer gpa.free(whole);
+-        try L.src.read(whole, t.bytes);
+-        for (ids, 0..) |id, r| @memcpy(host[at + r * row ..][0..row], whole[id * row ..][0..row]);
++        try gatherRows(L, t.*, ids, host[at..]);
+         t.shape[0] = ids.len;
+         t.bytes = host[at..][0 .. ids.len * row];
+         at += ids.len * row;
+@@ -540,6 +537,15 @@ fn loadMtp(gpa: std.mem.Allocator, io: std.Io, L: *Loader, main: *core.Checkpoin
+     try draftIds(L, ids);
+ }
+ 
++/// Rows `ids` of `t` (a row its first dimension's), in `ids`' order, into `host`: the whole tensor read once.
++pub fn gatherRows(L: *Loader, t: Tensor, ids: []const u32, host: []u8) !void {
++    const row = t.bytes.len / t.dim(0);
++    const whole = try L.gpa.alloc(u8, t.bytes.len);
++    defer L.gpa.free(whole);
++    try L.src.read(whole, t.bytes);
++    for (ids, 0..) |id, r| @memcpy(host[r * row ..][0..row], whole[id * row ..][0..row]);
++}
++
+ /// The vocabulary ids the draft head's rows are, on the GPU.
+ pub fn draftIds(L: *Loader, ids: []const u32) !void {
+     const wide = std.mem.bytesAsSlice(i64, try L.staging(ids.len * 8));
+-- 
+2.43.0
+

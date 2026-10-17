@@ -1,0 +1,916 @@
+From a4fa222ea2d847ace2e8460b1c7b53241a020de7 Mon Sep 17 00:00:00 2001
+From: plotarmordev <299844489+plotarmordev@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 23:04:19 +0800
+Subject: [PATCH 08/18] nemotron: Super verifies windows of up to 32 rows on
+ CUDA (31 MTP drafts a round)
+
+state.max_rows is 32 and state.windowRows(c) the width a checkpoint takes: 32 for a latent MoE (ModelOpt's FP8 lane
+tiles of 16 and 32 rows, bf16 and NVFP4 lanes, and per-pair experts give a row the same bits at any width), 16 for every
+other one, whose MLX affine-4 decode products (Nano's ModelOpt MTP head among them) tile 16 rows. Window buffers, the
+Mamba replay planes, captured windows and head levels, the cost table, the depth rule, copied chains, grammar windows,
+the lane facts and the pinned layouts follow it; the latent shared-expert plans cover max_rows, the non-latent ones
+stay at 16 rows. --mtp-drafts takes up to max_chain (31), and a lone stream's cap stops at its checkpoint's window.
+---
+ docs/recipes/nemotron-3.5-super-vl.md         |  6 ++--
+ zig/src/cli/cuda_checks.zig                   | 10 +++---
+ zig/src/cli/cuda_lanes.zig                    |  2 +-
+ zig/src/cli/cuda_main.zig                     |  7 ++--
+ zig/src/cli/cuda_shared_checks.zig            |  2 +-
+ zig/src/core/draft_depth.zig                  |  2 +-
+ zig/src/cuda/qlinear.zig                      |  4 ++-
+ zig/src/families/nemotron/cuda_costs.zig      | 26 +++++++--------
+ zig/src/families/nemotron/cuda_drafts.zig     | 28 +++++++++-------
+ zig/src/families/nemotron/cuda_engine.zig     | 33 ++++++++++---------
+ zig/src/families/nemotron/cuda_forward.zig    | 12 +++----
+ zig/src/families/nemotron/cuda_lanes.zig      | 25 +++++++-------
+ zig/src/families/nemotron/cuda_lone.zig       |  2 +-
+ zig/src/families/nemotron/cuda_mtp.zig        | 30 +++++++++--------
+ zig/src/families/nemotron/cuda_native.zig     |  6 +++-
+ .../families/nemotron/cuda_prompt_rows.zig    |  2 +-
+ zig/src/families/nemotron/cuda_state.zig      | 27 +++++++++------
+ zig/src/families/nemotron/cuda_train_fwd.zig  |  2 +-
+ zig/src/native/cuda_refusal.zig               |  6 ++--
+ zig/tests/cuda/chunk_costs.zig                |  2 +-
+ zig/tests/cuda/main.zig                       |  2 +-
+ zig/tests/cuda/recapture_tests.zig            |  2 +-
+ zig/tests/cuda/window_profile.zig             |  2 +-
+ 23 files changed, 131 insertions(+), 109 deletions(-)
+
+diff --git a/docs/recipes/nemotron-3.5-super-vl.md b/docs/recipes/nemotron-3.5-super-vl.md
+index 4d4a5229..14044da9 100644
+--- a/docs/recipes/nemotron-3.5-super-vl.md
++++ b/docs/recipes/nemotron-3.5-super-vl.md
+@@ -27,9 +27,9 @@ about 24 GB of the GB10's memory stays available. Leave the other ranks' variabl
+ 
+ The MTP draft head uses the embedded draft vocabulary's FP8 output rows rather than the full output head.
+ The target still verifies proposals with its unchanged full-vocabulary head.
+-For lone drafted streams, `--mtp-drafts` caps MTP depth and `--mtp-confidence` sets a cumulative-confidence
+-threshold instead of the cost-based cutoff. A zero draft cap disables drafting. Copied continuations and
+-concurrent streams retain their existing lane policies.
++For lone drafted streams, `--mtp-drafts` caps MTP depth (31 at most: Super verifies windows of up to 32 rows) and
++`--mtp-confidence` sets a cumulative-confidence threshold instead of the cost-based cutoff. A zero draft cap disables
++drafting. Copied continuations and concurrent streams retain their existing lane policies.
+ 
+ ## Run on two GB10s
+ 
+diff --git a/zig/src/cli/cuda_checks.zig b/zig/src/cli/cuda_checks.zig
+index 5551bf6b..d543055e 100644
+--- a/zig/src/cli/cuda_checks.zig
++++ b/zig/src/cli/cuda_checks.zig
+@@ -165,22 +165,22 @@ pub fn draws(gpa: std.mem.Allocator, io: std.Io, e: *nemotron.Engine, dir: []con
+     return if (bad == 0) 0 else 1;
+ }
+ 
+-/// Replay serial tokens as drafts at widths 1-16, injecting a wrong token every third window.
++/// Replay serial tokens as drafts at every width the engine takes, injecting a wrong token every third window.
+ pub fn widths(gpa: std.mem.Allocator, e: *nemotron.Engine, prompt: []const u32, count: usize) !u8 {
+-    const rows_max = nemotron.state.max_rows;
++    const rows_max = nemotron.state.windowRows(e.c);
+     var ref: std.ArrayList(u32) = .empty;
+     defer ref.deinit(gpa);
+     try ref.append(gpa, try e.prefill(prompt, null, null));
+     while (ref.items.len < count) try ref.append(gpa, try e.step(ref.items[ref.items.len - 1], null));
+     if (try e.prefill(prompt, null, null) != ref.items[0]) return error.FirstTokenDiffers;
+-    var rows_seen: [rows_max + 1]usize = @splat(0);
+-    var rows_bad: [rows_max + 1]usize = @splat(0);
++    var rows_seen: [nemotron.state.max_rows + 1]usize = @splat(0);
++    var rows_bad: [nemotron.state.max_rows + 1]usize = @splat(0);
+     var at: usize = 0;
+     var width: usize = 1;
+     var window: usize = 0;
+     while (at + 1 < ref.items.len) : (window += 1) {
+         const rows = @min(width, ref.items.len - 1 - at); // every row's draw has serial's token to meet
+-        var ids: [rows_max]u32 = undefined;
++        var ids: [nemotron.state.max_rows]u32 = undefined;
+         @memcpy(ids[0..rows], ref.items[at..][0..rows]);
+         var keep = rows;
+         if (window % 3 == 2 and rows > 2) { // a wrong draft: the rows from it on read a token serial never fed
+diff --git a/zig/src/cli/cuda_lanes.zig b/zig/src/cli/cuda_lanes.zig
+index c046ab70..6c1379a3 100644
+--- a/zig/src/cli/cuda_lanes.zig
++++ b/zig/src/cli/cuda_lanes.zig
+@@ -33,7 +33,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, e: *nemotron.Engine, model_dir: [
+     var cuda = try nemotron.Lanes.init(gpa, e, head);
+     defer cuda.deinit();
+     try cuda.measure(io, model_dir);
+-    const rows: u32 = if (head != null) nemotron.state.max_rows else 1;
++    const rows: u32 = if (head != null) @intCast(nemotron.state.windowRows(e.c)) else 1;
+     var cfg = try lanes.Config.init(gpa, cuda.facts(), rows, rows - 1);
+     defer cfg.deinit(gpa);
+     var clock = lanes.backend.WallClock{ .io = io };
+diff --git a/zig/src/cli/cuda_main.zig b/zig/src/cli/cuda_main.zig
+index f789ef76..09f3e479 100644
+--- a/zig/src/cli/cuda_main.zig
++++ b/zig/src/cli/cuda_main.zig
+@@ -19,7 +19,7 @@ const decode = nemotron.decode;
+ const usage =
+     \\usage: tensorfold run MODEL --tokens ID,ID,... [--max-tokens N] [--no-drafts] [--report PATH] [--kernels DIR|native] [--device N]
+     \\         [--temperature T] [--top-k K] [--top-p P] [--min-p M] [--seed S]   (temperature 0: greedy)
+-    \\         [--context N] [--ignore-eos] [--eager] [--costs MS1,...,MS16,LEVEL]
++    \\         [--context N] [--ignore-eos] [--eager] [--costs MS1,...,MSW,LEVEL]   (W window rows: 32 for a latent MoE, else 16)
+     \\         [--carveout]   (KV caches in GB10's display memory first; also TF_CUDA_CARVEOUT=1,
+     \\         sized by TF_CUDA_CARVEOUT_MIB (default 1792), card TF_DRM_CARD (default /dev/dri/card0))
+     \\         [--tokens-file PATH] [--segments N]   (N whole 2048-row prompt chunks a call as staggered segments,
+@@ -41,7 +41,7 @@ const usage =
+     \\       tensorfold kl MODEL --tokens ID,... [--gold ID,...] [--max-tokens N] (--dump FILE | --against FILE) [--precision P]
+     \\                (logits rows to FILE, fed --gold then greedy; or FILE's tokens fed: KL, top-1 and NLL against its rows)
+     \\       tensorfold widths MODEL --tokens ID,... [--max-tokens N] [--eager] [sampling as run]
+-    \\                (every verify width 1-16 against serial decoding, a wrong draft every third window)
++    \\                (every verify width, 1-32 for a latent MoE else 1-16, against serial decoding, a wrong draft every third window)
+     \\       tensorfold models
+     \\       tensorfold info MODEL
+     \\       tensorfold pull REPO[@REVISION]
+@@ -327,7 +327,8 @@ fn run(gpa: std.mem.Allocator, io: std.Io, e: *nemotron.Engine, o: Options) !u8
+     defer if (drafter) |*d| d.deinit();
+     if (drafter) |d| {
+         const v = d.rule.costs.verify;
+-        std.debug.print("up to 15 MTP drafts a round, each verified while it pays for its row (measured: {d:.2}/{d:.2}/{d:.2}/{d:.2}/{d:.2} ms at 1/2/4/8/16 rows, {d:.3} ms a draft)\n", .{ v[1], v[2], v[4], v[8], v[16], d.rule.costs.level });
++        const w = d.rule.costs.rows;
++        std.debug.print("up to {d} MTP drafts a round, each verified while it pays for its row (measured: {d:.2}/{d:.2}/{d:.2}/{d:.2}/{d:.2} ms at 1/2/4/8/{d} rows, {d:.3} ms a draft)\n", .{ w - 1, v[1], v[2], v[4], v[8], v[w], w, d.rule.costs.level });
+     }
+     const res = try decode.generate(gpa, io, e, if (drafter) |*d| d else null, o.tokens, count, .{ .stop_eos = o.stop_eos });
+     defer gpa.free(res.tokens);
+diff --git a/zig/src/cli/cuda_shared_checks.zig b/zig/src/cli/cuda_shared_checks.zig
+index 27292734..2bc28e95 100644
+--- a/zig/src/cli/cuda_shared_checks.zig
++++ b/zig/src/cli/cuda_shared_checks.zig
+@@ -40,7 +40,7 @@ pub fn widths(gpa: std.mem.Allocator, io: std.Io, e: *nemotron.Engine, path: []c
+     while (true) : (round += 1) {
+         var parts: [max_streams]nemotron.engine.Shared = undefined;
+         var n: usize = 0;
+-        var room: usize = max_rows;
++        var room: usize = nemotron.state.windowRows(e.c);
+         var waiting: usize = 0;
+         for (0..streams) |k| waiting += @intFromBool(at[k] + 1 < refs[k].items.len);
+         for (0..streams) |k| {
+diff --git a/zig/src/core/draft_depth.zig b/zig/src/core/draft_depth.zig
+index f1085afc..49250a53 100644
+--- a/zig/src/core/draft_depth.zig
++++ b/zig/src/core/draft_depth.zig
+@@ -2,7 +2,7 @@
+ 
+ const std = @import("std");
+ 
+-pub const max_rows = 16;
++pub const max_rows = 32; // the widest verify window a cost table holds
+ 
+ /// Measured ms on this GPU: `verify[r]` for a window of r rows (index 0 unused), `level` for one chain level.
+ pub const Costs = struct {
+diff --git a/zig/src/cuda/qlinear.zig b/zig/src/cuda/qlinear.zig
+index dbb86bb8..beff2620 100644
+--- a/zig/src/cuda/qlinear.zig
++++ b/zig/src/cuda/qlinear.zig
+@@ -226,6 +226,8 @@ fn u(x: usize) u32 {
+ 
+ /// The affine-4 kernels: qmm_group's cluster tile, lane_gemv and its split-K form, qmm_prefill's prompt GEMM.
+ pub const Affine4Kernels = struct {
++    pub const max_rows = 16; // rows decode() takes: its kernels tile 16 rows
++
+     group_fn: Function,
+     gemv_fn: Function,
+     split_fn: Function,
+@@ -281,7 +283,7 @@ pub const Affine4Kernels = struct {
+ 
+     /// qmm.matmul: x (rows, k) bf16 with group sums xs -> out (rows, n) bf16, qmm_group's tile-2 bits on every path.
+     pub fn decode(a: *const Affine4Kernels, s: Stream, x: u64, xs: u64, q: Affine4, out: u64, rows: usize) !void {
+-        if (rows > 16) return error.WindowTooWide;
++        if (rows > max_rows) return error.WindowTooWide;
+         const sk = splitK(q.n, q.k);
+         if (sk > 1) if (a.split) |sp| return a.gemvSplit(s, x, xs, q, out, rows, sk, sp);
+         return if (sk > 1) a.gemv(s, x, xs, q, out, rows, sk) else a.cluster(s, x, xs, q, out, rows, sk);
+diff --git a/zig/src/families/nemotron/cuda_costs.zig b/zig/src/families/nemotron/cuda_costs.zig
+index c8f13f7a..10fcc9d0 100644
+--- a/zig/src/families/nemotron/cuda_costs.zig
++++ b/zig/src/families/nemotron/cuda_costs.zig
+@@ -17,8 +17,6 @@ const text = "The river had been rising for three days, and by the time the ferr
+     "twice, wrote the numbers on the wall, and cut slowly.\n\ndef mean(values):\n    total = 0\n    for v in " ++
+     "values:\n        total += v\n    return total / len(values)\n";
+ 
+-const max_rows = state.max_rows;
+-
+ const Timer = struct {
+     a: cuda.Event,
+     b: cuda.Event,
+@@ -55,18 +53,19 @@ pub fn measure(gpa: std.mem.Allocator, io: std.Io, e: *Engine, h: *Head, model_d
+     const rk = lanes.cost_cache.cudaReferenceKey(&parts);
+     var raw: Raw = undefined;
+     try timeAll(gpa, io, e, h, model_dir, &raw, false);
+-    var costs = core.draft_depth.Costs.measured(&raw.verify, raw.level);
++    const widths = state.windowRows(e.c) + 1;
++    var costs = core.draft_depth.Costs.measured(raw.verify[0..widths], raw.level);
+     if (lanes.cost_cache.load(core.draft_depth.Costs, gpa, io, rk)) |ref| if (drifted(costs, ref)) {
+         try timeAll(gpa, io, e, h, model_dir, &raw, true);
+-        costs = core.draft_depth.Costs.measured(&raw.verify, raw.level);
++        costs = core.draft_depth.Costs.measured(raw.verify[0..widths], raw.level);
+     };
+     if (k) |key| lanes.cost_cache.save(core.draft_depth.Costs, gpa, io, key, costs);
+     lanes.cost_cache.save(core.draft_depth.Costs, gpa, io, rk, costs);
+     return costs;
+ }
+ 
+-/// Fastest-run window ms by width (index 0 unused) and a head level's ms.
+-const Raw = struct { verify: [max_rows + 1]f64, level: f64 };
++/// Fastest-run window ms by width (index 0 unused; widths to the engine's window) and a head level's ms.
++const Raw = struct { verify: [state.max_rows + 1]f64, level: f64 };
+ 
+ /// Time widths with interleaved levels, retime dips, and retain faster values on a retry.
+ fn timeAll(gpa: std.mem.Allocator, io: std.Io, e: *Engine, h: *Head, model_dir: []const u8, raw: *Raw, again: bool) !void {
+@@ -76,7 +75,7 @@ fn timeAll(gpa: std.mem.Allocator, io: std.Io, e: *Engine, h: *Head, model_dir:
+     defer tok.deinit();
+     const ids = try tok.encode(gpa, text);
+     defer gpa.free(ids);
+-    const rows = max_rows;
++    const rows = state.windowRows(e.c);
+     if (ids.len < 2 * rows + 2) return error.CostTextTooShort;
+     const pending = try e.prefill(ids[0..rows], null, h);
+     const last_hidden = e.b.p_hidden + (rows - 1) * @as(u64, e.c.hidden) * 2;
+@@ -89,9 +88,9 @@ fn timeAll(gpa: std.mem.Allocator, io: std.Io, e: *Engine, h: *Head, model_dir:
+     defer last_saved.free();
+     try e.ops().copy(last_saved.ptr, last_hidden, e.c.hidden * 2);
+     const cont = ids[rows..];
+-    var next = try cuda.DeviceBuffer.alloc(e.ctx.d, max_rows * 4); // the text's own next tokens: the window's drafts
++    var next = try cuda.DeviceBuffer.alloc(e.ctx.d, rows * 4); // the text's own next tokens: the window's drafts
+     defer next.free();
+-    try e.ops().upload(next.ptr, std.mem.sliceAsBytes(cont[0..max_rows]));
++    try e.ops().upload(next.ptr, std.mem.sliceAsBytes(cont[0..rows]));
+     var t: Timer = .{ .a = try cuda.Event.init(e.ctx.d, true), .b = try cuda.Event.init(e.ctx.d, true) };
+     defer t.a.deinit();
+     defer t.b.deinit();
+@@ -103,13 +102,14 @@ fn timeAll(gpa: std.mem.Allocator, io: std.Io, e: *Engine, h: *Head, model_dir:
+         saved: cuda.DeviceBuffer,
+         head_saved: cuda.DeviceBuffer,
+         head_pos: usize,
++        pos: usize,
+         last: u64,
+         pending: u32,
+         continuation: u64,
+ 
+         pub fn restore(w: *@This()) !void {
+             try w.e.b.restore(w.e.ops(), w.saved);
+-            w.e.pos = max_rows;
++            w.e.pos = w.pos;
+             w.e.parity = 0;
+             w.e.prev_keep = 0;
+         }
+@@ -162,11 +162,11 @@ fn timeAll(gpa: std.mem.Allocator, io: std.Io, e: *Engine, h: *Head, model_dir:
+             return l.t.ms(l.e);
+         }
+     };
+-    const windows: W = .{ .e = e, .h = h, .t = t, .saved = saved, .head_saved = head_saved, .head_pos = head_pos, .last = last_saved.ptr, .pending = pending, .continuation = next.ptr };
++    const windows: W = .{ .e = e, .h = h, .t = t, .saved = saved, .head_saved = head_saved, .head_pos = head_pos, .pos = rows, .last = last_saved.ptr, .pending = pending, .continuation = next.ptr };
+     var chains: rule.ChainLevel(L) = .{ .timer = .{ .e = e, .h = h, .t = t, .saved = head_saved, .pos = head_pos, .last = last_hidden, .pending = pending } };
+-    try rule.measureWidths(windows, &chains, raw.verify[1..], again);
++    try rule.measureWidths(windows, &chains, raw.verify[1 .. rows + 1], again);
+     if (!again) raw.verify[0] = 0;
+-    try rule.smooth(windows, raw.verify[1..]);
++    try rule.smooth(windows, raw.verify[1 .. rows + 1]);
+     const level = chains.level();
+     raw.level = if (again) @min(raw.level, level) else level;
+     try e.reset();
+diff --git a/zig/src/families/nemotron/cuda_drafts.zig b/zig/src/families/nemotron/cuda_drafts.zig
+index bf1f233f..66ad3139 100644
+--- a/zig/src/families/nemotron/cuda_drafts.zig
++++ b/zig/src/families/nemotron/cuda_drafts.zig
+@@ -6,6 +6,7 @@ const lanes = @import("lanes");
+ const Engine = @import("cuda_engine.zig").Engine;
+ const mtp = @import("cuda_mtp.zig");
+ const Head = mtp.Head;
++const state = @import("cuda_state.zig");
+ const Mask = @import("cuda_engine.zig").Mask;
+ const DepthRule = core.draft_depth.DepthRule;
+ 
+@@ -105,14 +106,15 @@ pub const Rounds = struct {
+     /// The context's own copied chain, else Recall's continuation when it is expected to pay (in `cbuf`).
+     fn copies(r: *Rounds) []const u32 {
+         r.recalled = false;
+-        const own = r.index.chain(&r.cbuf);
++        const room = r.cbuf[0 .. state.windowRows(r.e.c) - 1];
++        const own = r.index.chain(room);
+         const x = r.recall orelse return own;
+         if (own.len > 0) return own;
+-        const got = x.propose(r.index.ctx.items, r.cbuf.len, r.st.rounds);
++        const got = x.propose(r.index.ctx.items, room.len, r.st.rounds);
+         if (got.len < 2) return &.{};
+-        @memcpy(r.cbuf[0..got.len], got);
++        @memcpy(room[0..got.len], got);
+         r.recalled = true;
+-        return r.cbuf[0..got.len];
++        return room[0..got.len];
+     }
+ 
+     /// One window after `last`: the copied chain or the head's drafts, verified; its drawn tokens and drafts accepted.
+@@ -123,7 +125,7 @@ pub const Rounds = struct {
+             const planned = if (r.copy_round) r.copied else r.h.drafts()[0..try depth(r.h, r.rule)];
+             r.ids[0] = last;
+             @memcpy(r.ids[1..][0..planned.len], planned);
+-            const w = try g.window(g.ptr, &r.ids, 1 + planned.len);
++            const w = try g.window(g.ptr, r.ids[0..state.windowRows(e.c)], 1 + planned.len);
+             try e.verifyMasked(r.ids[0..w.rows], w.rows, null, w.mask);
+             r.proposal = r.ids[1..w.rows];
+         } else if (r.copy_round) {
+@@ -183,17 +185,19 @@ pub const Drafter = struct {
+     head: *Head,
+     rule: DepthRule,
+ 
+-    /// `costs`: window ms at 1..16 rows then a level's ms, as another run measured them; null measures them here.
++    /// `costs`: window ms at every width the engine takes, then a level's ms, as another run measured them; null
++    /// measures them here.
+     pub fn init(gpa: std.mem.Allocator, io: std.Io, e: *Engine, model_dir: []const u8, graphs: bool, costs: ?[]const f64) !Drafter {
+         const h = try Head.init(e);
+         errdefer h.deinit();
+         if (graphs) try h.capture();
+         var c: core.draft_depth.Costs = .{};
+         if (costs) |given| {
+-            if (given.len != 17) return error.CostsNeedSeventeenValues;
+-            c.rows = 16;
+-            @memcpy(c.verify[1..17], given[0..16]);
+-            c.level = given[16];
++            const rows = state.windowRows(e.c);
++            if (given.len != rows + 1) return error.CostsNeedEveryWidth;
++            c.rows = rows;
++            @memcpy(c.verify[1 .. rows + 1], given[0..rows]);
++            c.level = given[rows];
+         } else c = try @import("cuda_costs.zig").measure(gpa, io, e, h, model_dir);
+         return .{ .head = h, .rule = depthRule(c) };
+     }
+@@ -203,7 +207,7 @@ pub const Drafter = struct {
+     }
+ };
+ 
+-/// The depth rule `run` and a lone served stream draft by: greedy calibration power 2, every draft depth.
++/// The depth rule `run` and a lone served stream draft by: greedy calibration power 2, as deep as the costs' widths.
+ pub fn depthRule(c: core.draft_depth.Costs) DepthRule {
+-    return DepthRule.init(c, mtp.max_chain, null, 2.0);
++    return DepthRule.init(c, c.rows - 1, null, 2.0);
+ }
+diff --git a/zig/src/families/nemotron/cuda_engine.zig b/zig/src/families/nemotron/cuda_engine.zig
+index 4c441b41..e97c4fda 100644
+--- a/zig/src/families/nemotron/cuda_engine.zig
++++ b/zig/src/families/nemotron/cuda_engine.zig
+@@ -71,14 +71,15 @@ pub const Taps = struct { ctx: *anyopaque, call: *const fn (ctx: *anyopaque, hid
+ /// Serial rounds a host keeps queued ahead of the one it reads.
+ pub const lookahead = 4;
+ 
+-/// Streams a shared window holds at most (their rows together at most state.max_rows).
++/// Streams a shared window holds at most (their rows together at most state.windowRows).
+ pub const max_streams = 8;
+ 
+-// pinned words: the window's meta row, its ids, its sampled ids, a prompt chunk's ids, then 64 a shared window's stream
++// pinned words: the window's meta row, its ids, its sampled ids, a prompt chunk's ids, then a shared window's streams
+ const pin_meta = 0;
+ const pin_ids = 4;
+-pub const pin_sampled = 32;
+-pub const pin_prompt = 64;
++pub const pin_sampled = pin_ids + state.max_rows;
++const window_words = pin_sampled + state.max_rows; // a window's words, as a shared window's stream lays its own out
++pub const pin_prompt = window_words;
+ const pin_shared = pin_prompt + @max(segs.MAX * state.prefill_rows, state.pass_rows);
+ /// Graph ids of masked verify windows (launchGraph's ids: windows from 1, head levels from 1000).
+ const masked_ids = 4000;
+@@ -197,7 +198,7 @@ pub const Engine = struct {
+         errdefer if (e.seg) |*s| s.deinit();
+         e.own = state.Seq.view(&e.b);
+         e.bound = &e.own;
+-        e.pinned = try cuda.HostBuffer.alloc(ctx.d, (pin_shared + max_streams * 64) * 4);
++        e.pinned = try cuda.HostBuffer.alloc(ctx.d, (pin_shared + max_streams * window_words) * 4);
+         errdefer e.pinned.free();
+         e.history = try cuda.HostBuffer.allocMapped(ctx.d, (@as(usize, e.max_len) + state.max_rows) * 4);
+         errdefer e.history.free();
+@@ -231,7 +232,7 @@ pub const Engine = struct {
+     /// The verify windows of the bound sequence's draw mode (greedy or sampled), each one graph.
+     pub fn captureWindows(e: *Engine) !void {
+         const set = &e.windows[@intFromBool(e.sampling != null)];
+-        for (1..state.max_rows + 1) |r| set[r] = try e.record(.{ .window = .{ .rows = r, .feed = false } });
++        for (1..state.windowRows(e.c) + 1) |r| set[r] = try e.record(.{ .window = .{ .rows = r, .feed = false } });
+     }
+ 
+     /// What a graph runs: a verify window (with the serial feed or the sampled download), or one MTP head level.
+@@ -446,7 +447,7 @@ pub const Engine = struct {
+ 
+     /// verify with a grammar's bits for each row: its logits masked before its draws, a graph each row count once made.
+     pub fn verifyMasked(e: *Engine, ids: []const u32, rows: usize, dump: ?*Dump, mask: Mask) !void {
+-        if (rows < 1 or rows > state.max_rows or ids.len > rows) return error.BadWindow;
++        if (rows < 1 or rows > state.windowRows(e.c) or ids.len > rows) return error.BadWindow;
+         if (e.pos + rows > e.max_len) return error.ContextFull;
+         try e.copied.synchronize();
+         const host = e.pinned.slice(u32);
+@@ -485,27 +486,27 @@ pub const Engine = struct {
+             if (p.rows < 1 or p.ids.len < 1 or p.ids.len > p.rows) return error.BadWindow;
+             total += p.rows;
+         }
+-        if (total > state.max_rows) return error.WindowTooWide;
++        if (total > state.windowRows(e.c)) return error.WindowTooWide;
+         try e.copied.synchronize();
+-        const host = e.pinned.slice(u32)[pin_shared..][0 .. max_streams * 64];
++        const host = e.pinned.slice(u32)[pin_shared..][0 .. max_streams * window_words];
+         var views: [max_streams]state.Buffers = undefined;
+         var parts_f: [max_streams]Seg = undefined;
+         var row0: usize = 0;
+         for (parts, 0..) |p, k| {
+             e.bind(p.seq);
+             if (e.pos + p.rows > e.max_len) return error.ContextFull;
+-            const slot = host[k * 64 ..][0..64];
+-            slot[0..4].* = e.metaRow();
+-            @memcpy(slot[4..][0..p.ids.len], p.ids);
+-            try e.ops().upload(e.b.ids, std.mem.sliceAsBytes(slot[4..][0..p.ids.len]));
+-            try e.ops().upload(e.b.meta, std.mem.sliceAsBytes(slot[0..4]));
++            const slot = host[k * window_words ..][0..window_words];
++            slot[pin_meta..][0..4].* = e.metaRow();
++            @memcpy(slot[pin_ids..][0..p.ids.len], p.ids);
++            try e.ops().upload(e.b.ids, std.mem.sliceAsBytes(slot[pin_ids..][0..p.ids.len]));
++            try e.ops().upload(e.b.meta, std.mem.sliceAsBytes(slot[pin_meta..][0..4]));
+             views[k] = e.b; // the bound sequence's own fields beside the shared scratch
+             parts_f[k] = .{ .b = &views[k], .row0 = row0, .rows = p.rows, .sampled = e.sampling != null, .mask = p.mask, .slot = p.seq.slot, .untaught = p.seq.untaught };
+             row0 += p.rows;
+         }
+         try e.copied.record(e.stream);
+         try e.forward(null).windowSegs(parts_f[0..parts.len]);
+-        for (parts, 0..) |p, k| try e.ops().download(std.mem.sliceAsBytes(host[k * 64 + 32 ..][0..p.rows]), views[k].sampled);
++        for (parts, 0..) |p, k| try e.ops().download(std.mem.sliceAsBytes(host[k * window_words + pin_sampled ..][0..p.rows]), views[k].sampled);
+         try e.sampled_ready.record(e.stream);
+         for (parts) |p| {
+             e.bind(p.seq);
+@@ -517,7 +518,7 @@ pub const Engine = struct {
+     /// Part k's drawn ids from the last shared window (row r: the token at its position + r + 1).
+     pub fn sharedTokens(e: *Engine, k: usize, rows: usize) ![]const u32 {
+         try e.sampled_ready.synchronize();
+-        return e.pinned.slice(u32)[pin_shared + k * 64 + 32 ..][0..rows];
++        return e.pinned.slice(u32)[pin_shared + k * window_words + pin_sampled ..][0..rows];
+     }
+ 
+     /// The window's meta row as the kernels read it: position, buffer parity, previous keep, a spare word.
+diff --git a/zig/src/families/nemotron/cuda_forward.zig b/zig/src/families/nemotron/cuda_forward.zig
+index 2a7c6d75..994503cc 100644
+--- a/zig/src/families/nemotron/cuda_forward.zig
++++ b/zig/src/families/nemotron/cuda_forward.zig
+@@ -94,9 +94,9 @@ pub const Forward = struct {
+         if (f.marks) |m| try m.add(f.ops.s, c);
+     }
+ 
+-    fn mshape(f: *const Forward, rmax: usize) glue.Shape {
++    fn mshape(f: *const Forward) glue.Shape {
+         const c = f.c;
+-        return .{ .proj = c.projDim(), .xd = c.inner(), .cd = c.convDim(), .heads = c.mamba_heads, .dh = c.mamba_head_dim, .groups = c.groups, .state = c.state, .rmax = rmax };
++        return .{ .proj = c.projDim(), .xd = c.inner(), .cd = c.convDim(), .heads = c.mamba_heads, .dh = c.mamba_head_dim, .groups = c.groups, .state = c.state, .rmax = state.windowRows(c) };
+     }
+ 
+     pub fn ashape(f: *const Forward) glue.Attn {
+@@ -143,12 +143,12 @@ pub const Forward = struct {
+         const b = f.b;
+         const o = f.ops;
+         const t = f.glue;
+-        const ms = f.mshape(state.max_rows);
++        const ms = f.mshape();
+         const at = f.ashape();
+         const D: u64 = c.hidden;
+         var rows: usize = 0;
+         for (segs) |s| rows += s.rows;
+-        if (rows > state.max_rows) return error.WindowTooWide;
++        if (rows > ms.rmax) return error.WindowTooWide;
+         for (segs) |s| try f.embed(s.b.ids, b.emb + s.row0 * D * 2, s.rows);
+         try f.mark(.embed);
+         var x = b.emb;
+@@ -160,7 +160,7 @@ pub const Forward = struct {
+             switch (blk.kind) {
+                 .mamba => {
+                     const m = blk.mamba;
+-                    const W: u64 = state.max_rows;
++                    const W: u64 = ms.rmax;
+                     try o.dense(b.y, b.xs, m.in_proj, b.proj, rows);
+                     try f.mark(.mamba_in);
+                     var k0: usize = 0;
+@@ -382,7 +382,7 @@ pub const Forward = struct {
+                     snaps.p[k] = cap.ssm + w.mj * layer;
+                     snaps.r[k] = @intCast(cap.at - w.pos);
+                 }
+-                try f.glue.convRows(b.proj, base, b.p_xc, m.conv_w, m.conv_b, w.rows, f.mshape(state.max_rows));
++                try f.glue.convRows(b.proj, base, b.p_xc, m.conv_w, m.conv_b, w.rows, f.mshape());
+                 try o.scanRows(b.proj, b.p_xc, b.ssm + w.mj * layer, m.a, m.d, m.dt_bias, b.sy, w.rows, c.projDim(), c.mamba_heads, c.mamba_head_dim, c.convDim(), c.groups, c.dt_min, c.dt_max, snaps);
+             },
+             .attention => {
+diff --git a/zig/src/families/nemotron/cuda_lanes.zig b/zig/src/families/nemotron/cuda_lanes.zig
+index 86998374..974beea1 100644
+--- a/zig/src/families/nemotron/cuda_lanes.zig
++++ b/zig/src/families/nemotron/cuda_lanes.zig
+@@ -127,7 +127,7 @@ pub const Cuda = struct {
+     fn heldFn(ptr: *anyopaque, s: *lanes.Stream, out: []u32) anyerror!void {
+         const self = of(ptr);
+         const l = self.lanes.getPtr(s) orelse return error.UnknownStream;
+-        if (out.len + 1 > state.max_rows) return error.WindowTooWide;
++        if (out.len + 1 > state.windowRows(self.e.c)) return error.WindowTooWide;
+         self.e.bind(l.seq);
+         const held = self.pinned.slice(u32)[0..out.len];
+         try self.e.ops().download(std.mem.sliceAsBytes(held), self.e.b.ids + 4);
+@@ -135,27 +135,28 @@ pub const Cuda = struct {
+         @memcpy(out, held);
+     }
+ 
+-    /// The facts the round loop reads at setup: windows up to 16 rows, one stream a forward, this GPU's costs.
++    /// The facts the round loop reads at setup: windows of the engine's width, one stream a forward, this GPU's costs.
+     pub fn facts(self: *const Cuda) lanes.Model {
+         const drafting = self.head != null;
++        const width = state.windowRows(self.e.c);
+         return .{
+-            .exact_width = if (drafting) state.max_rows else 1,
++            .exact_width = if (drafting) @intCast(width) else 1,
+             .gpu_tokens = false,
+             .mtp = drafting,
+             .speculate = drafting,
+             .speculate_early = false,
+             .draft_prior = &config.draft_prior,
+-            .drafts = mtp.max_chain,
++            .drafts = @intCast(width - 1),
+             .draft_streams = drafting, // a shared round's heads draft in one batch (Head.chains)
+             .window_costs = self.costs[0..self.cost_count],
+             .mtp_step_ms = self.mtp_ms,
+             .hidden_rows = drafting, // several streams' windows share a forward (Engine.verifyShared)
+-            .batch_rows = state.max_rows,
++            .batch_rows = @intCast(width),
+             .max_streams = if (drafting) engine.max_streams else 1,
+         };
+     }
+ 
+-    /// costs.measure on the engine's own sequence: windows of 1 to 16 rows and a head level, in ms.
++    /// costs.measure on the engine's own sequence: windows of every width it takes and a head level, in ms.
+     pub fn measure(self: *Cuda, io: std.Io, model_dir: []const u8) !void {
+         const h = self.head orelse return;
+         self.e.bind(&self.e.own);
+@@ -273,9 +274,9 @@ pub const Cuda = struct {
+         var sink: PromptSink = .{ .gpa = self.gpa, .s = s };
+         s.prompt_rows.clearRetainingCapacity();
+         if (s.prompt_logprobs) |k| {
+-            // a logits buffer of its own takes batch_rows a head pass; without the memory, the window's state.max_rows
++            // a logits buffer of its own takes batch_rows a head pass; without the memory, the window's rows
+             if (self.prompt_logits == null) self.prompt_logits = cuda.DeviceBuffer.alloc(e.ctx.d, prompt_rows.batch_rows * e.c.vocab * 2) catch null;
+-            const rows: usize = if (self.prompt_logits != null) prompt_rows.batch_rows else state.max_rows;
++            const rows: usize = if (self.prompt_logits != null) prompt_rows.batch_rows else state.windowRows(e.c);
+             const words = self.prompt_out.slice(u32);
+             const picks_at = rows * row_words; // after the rows
+             e.prompt_rows = .{ .k = k, .rows = rows, .logits = if (self.prompt_logits) |b| b.ptr else e.b.logits, .picks = words[picks_at..][0..rows], .picks_dev = self.prompt_dev + picks_at * 4, .out = words[0..picks_at], .out_dev = self.prompt_dev, .stride = row_words, .ctx = &sink, .call = PromptSink.take };
+@@ -353,7 +354,7 @@ pub const Cuda = struct {
+             if (start < t.from or start + count > t.from + t.prompt.items.len / d) return error.RowsNotHeld;
+             return .{ .buffer = @intFromPtr(t.prompt.items.ptr), .offset = (start - t.from) * d, .rows = count, .row_bytes = @intCast(d), .space = .host, .dtype = .bf16 };
+         }
+-        if (start != t.verified.? or count > state.max_rows) return error.RowsNotHeld;
++        if (start != t.verified.? or count > state.windowRows(self.e.c)) return error.RowsNotHeld;
+         self.e.bind(l.seq);
+         const host = self.tapped.?.slice(u8)[0 .. count * d];
+         try self.e.ops().download(host, self.e.b.hidden);
+@@ -396,7 +397,7 @@ pub const Cuda = struct {
+         const e = self.e;
+         verified(self.gpa, l, e.pos);
+         const rows = w.rows();
+-        if (rows > state.max_rows) return error.WindowTooWide;
++        if (rows > state.windowRows(e.c)) return error.WindowTooWide;
+         for (w.positions, 0..) |p, r| if (p != e.pos + 1 + r) return error.PositionMismatch;
+         var ids: [state.max_rows]u32 = undefined;
+         ids[0] = w.pending;
+@@ -492,12 +493,12 @@ pub const Cuda = struct {
+                 first[0] = self.value(r.first orelse return error.NoFirstToken);
+                 break :blk first[0..];
+             };
+-            if (drafting < 2 or r.depth == 0 or batched == parts.len or rows + follow.len > state.max_rows) {
++            if (drafting < 2 or r.depth == 0 or batched == parts.len or rows + follow.len > state.windowRows(self.e.c)) {
+                 try h.chain(follow, r.depth);
+                 l.keep = h.keep;
+                 continue;
+             }
+-            if (r.depth > mtp.max_chain) return error.BadDraftRequest;
++            if (r.depth >= state.windowRows(self.e.c)) return error.BadDraftRequest;
+             try self.e.ops().upload(self.e.b.sampled, std.mem.sliceAsBytes(follow));
+             parts[batched] = .{ .k_cache = h.k_cache, .v_cache = h.v_cache, .probs = h.probs, .ids = self.e.b.ids, .hidden = self.e.b.hidden, .sampled = self.e.b.sampled, .rule = if (self.e.sampling != null) self.e.b.rule else null, .pos = h.pos, .keep = follow.len, .depth = r.depth };
+             l.keep = follow.len; // as h.chain records h.keep: a reclaim begins this head again at these rows
+diff --git a/zig/src/families/nemotron/cuda_lone.zig b/zig/src/families/nemotron/cuda_lone.zig
+index 0ff50e0c..6bbf8851 100644
+--- a/zig/src/families/nemotron/cuda_lone.zig
++++ b/zig/src/families/nemotron/cuda_lone.zig
+@@ -43,7 +43,7 @@ pub fn run(gpa: std.mem.Allocator, b: *Cuda, s: *lanes.Stream, hooks: Hooks) !bo
+     if (kept_rows == null) hooks.committed(hooks.ctx);
+     if (s.finished) return false;
+     var rule = drafts.depthRule(costs);
+-    if (b.mtp_drafts) |most| rule.most = most;
++    if (b.mtp_drafts) |most| rule.most = most; // open refused caps past the checkpoint's window
+     rule.floor = b.mtp_confidence;
+     var r = if (kept_rows) |k|
+         try drafts.Rounds.resumed(gpa, b.e, h, &rule, s.prompt(), s.emitted(), k, s.recall)
+diff --git a/zig/src/families/nemotron/cuda_mtp.zig b/zig/src/families/nemotron/cuda_mtp.zig
+index c2588382..d2ebabc8 100644
+--- a/zig/src/families/nemotron/cuda_mtp.zig
++++ b/zig/src/families/nemotron/cuda_mtp.zig
+@@ -9,13 +9,14 @@ const state = @import("cuda_state.zig");
+ const Engine = @import("cuda_engine.zig").Engine;
+ const streams = @import("cuda_engine.zig").max_streams;
+ 
+-pub const max_chain = 15; // drafts a window holds beside the pending token
++pub const max_chain = state.max_rows - 1; // drafts a window holds beside the pending token
+ /// What a sequence keeps of the head between rounds: its caches and its drafts' confidences.
+ pub const seq_fields = [_][]const u8{ "k_cache", "v_cache", "probs" };
+-const host_drafts = 32; // pinned layout: meta at 0, drafts at 32, confidences at 64 (int32 words)
+-const host_probs = 64;
+-const host_metas = 128 + state.pass_rows; // after the prompt tokens: a meta row a stream for `chains`
+-const meta_words = 32;
++const meta_words = 1 + state.max_rows; // a meta row: the head's position, then each window row's
++const host_drafts = meta_words; // pinned layout: meta, drafts, confidences, then a prompt chunk's tokens (int32 words)
++const host_probs = host_drafts + max_chain;
++const host_tokens = host_probs + max_chain;
++const host_metas = host_tokens + state.pass_rows; // a meta row a stream for `chains`
+ 
+ /// One stream of a batched draft (`chains`): its head and target buffers, kept rows and depth.
+ pub const Part = struct {
+@@ -81,7 +82,7 @@ pub const Head = struct {
+         const kv: usize = @as(usize, e.max_len) * c.kv_heads * c.head_dim * 2;
+         const n = e.w.draft_count;
+         const S: usize = streams;
+-        const sizes = [_]usize{ kv, kv, 17 * 4, state.max_rows * D * 2, state.max_rows * 4, max_chain * 4, D * 2, R * D * 2, R * 2 * D * 2, R * 2 * D / 64 * 4, R * D * 2, S * D * 2, S * D * 2, S * D * 2, S * D / 64 * 4, S * n * 2, n * 4, sampler.max_candidates * 4, sampler.max_candidates * 8, sampler.max_candidates * 8, 32, S * D * 2, S * meta_words * 4, R * 4, torch_ops.topkScratchBytes(1, n), 4 };
++        const sizes = [_]usize{ kv, kv, meta_words * 4, state.max_rows * D * 2, state.max_rows * 4, max_chain * 4, D * 2, R * D * 2, R * 2 * D * 2, R * 2 * D / 64 * 4, R * D * 2, S * D * 2, S * D * 2, S * D * 2, S * D / 64 * 4, S * n * 2, n * 4, sampler.max_candidates * 4, sampler.max_candidates * 8, sampler.max_candidates * 8, 32, S * D * 2, S * meta_words * 4, R * 4, torch_ops.topkScratchBytes(1, n), 4 };
+         var total: usize = 0;
+         for (sizes) |s| total += std.mem.alignForward(usize, s, 256);
+         const h = try e.gpa.create(Head);
+@@ -246,11 +247,12 @@ pub const Head = struct {
+     /// MTPHead.capture: levels 0 and 1 at every kept-row count, later levels at one row, in the bound draw mode.
+     pub fn capture(h: *Head) !void {
+         const m = @intFromBool(h.e.sampling != null);
+-        for (1..state.max_rows + 1) |k| {
++        const rows = state.windowRows(h.e.c);
++        for (1..rows + 1) |k| {
+             if (h.absorb_graphs[k] == null) h.absorb_graphs[k] = try h.record(k, 0);
+             h.first_graphs[m][k] = try h.record(k, 1);
+         }
+-        for (2..max_chain + 1) |j| h.chain_graphs[m][j] = try h.record(1, j);
++        for (2..rows) |j| h.chain_graphs[m][j] = try h.record(1, j);
+     }
+ 
+     fn record(h: *Head, rows: usize, j: usize) !cuda.graph.Exec {
+@@ -260,7 +262,7 @@ pub const Head = struct {
+     /// MTPHead.begin: the head absorbs the last window's first `keep` rows, then drafts the positions after them.
+     pub fn begin(h: *Head, keep: usize) !void {
+         try h.copied.synchronize();
+-        const m = h.pinned.slice(u32)[0..17];
++        const m = h.pinned.slice(u32)[0..meta_words];
+         m[0] = @intCast(h.pos);
+         for (0..max_chain + 1) |j| m[1 + j] = @intCast(h.pos + keep + j);
+         try h.e.ops().upload(h.meta, std.mem.sliceAsBytes(m));
+@@ -293,7 +295,7 @@ pub const Head = struct {
+ 
+     /// The lane core's draft request: absorb `follow.len` kept rows (follow: the token after each), then `depth` levels.
+     pub fn chain(h: *Head, follow: []const u32, depth: usize) !void {
+-        if (follow.len < 1 or follow.len > state.max_rows or depth > max_chain) return error.BadDraftRequest;
++        if (follow.len < 1 or follow.len > state.windowRows(h.e.c) or depth >= state.windowRows(h.e.c)) return error.BadDraftRequest;
+         try h.e.ops().upload(h.e.b.sampled, std.mem.sliceAsBytes(follow));
+         try h.begin(follow.len);
+         if (depth == 0) return h.launch(0);
+@@ -309,10 +311,10 @@ pub const Head = struct {
+         if (parts.len < 1 or parts.len > streams) return error.BadDraftRequest;
+         var total: usize = 0;
+         for (parts) |p| {
+-            if (p.keep < 1 or p.depth < 1 or p.depth > max_chain) return error.BadDraftRequest;
++            if (p.keep < 1 or p.depth < 1 or p.depth >= state.windowRows(e.c)) return error.BadDraftRequest;
+             total += p.keep;
+         }
+-        if (total > state.max_rows) return error.BadDraftRequest;
++        if (total > state.windowRows(e.c)) return error.BadDraftRequest;
+         // the deepest first: the streams still drafting at a level are the leading rows of the last level's output
+         std.mem.sort(Part, parts, {}, struct {
+             fn deeper(_: void, x: Part, y: Part) bool {
+@@ -322,7 +324,7 @@ pub const Head = struct {
+         try h.copied.synchronize();
+         const host = h.pinned.slice(u32)[host_metas..][0 .. parts.len * meta_words];
+         for (parts, 0..) |p, k| {
+-            const m = host[k * meta_words ..][0..17];
++            const m = host[k * meta_words ..][0..meta_words];
+             m[0] = @intCast(p.pos);
+             for (0..max_chain + 1) |j| m[1 + j] = @intCast(p.pos + p.keep + j);
+         }
+@@ -393,7 +395,7 @@ pub const Head = struct {
+         const rows = tokens.len;
+         if (rows == 0) return;
+         try h.copied.synchronize();
+-        const host = h.pinned.slice(u32)[128..][0..tokens.len];
++        const host = h.pinned.slice(u32)[host_tokens..][0..tokens.len];
+         @memcpy(host, tokens);
+         try o.upload(h.atok, std.mem.sliceAsBytes(host));
+         try f.embed(h.atok, h.emb, rows);
+diff --git a/zig/src/families/nemotron/cuda_native.zig b/zig/src/families/nemotron/cuda_native.zig
+index 0fbe17df..af32a8c1 100644
+--- a/zig/src/families/nemotron/cuda_native.zig
++++ b/zig/src/families/nemotron/cuda_native.zig
+@@ -26,6 +26,7 @@ pub const formats: []const []const u8 = &.{ "mlx-q4g64", "modelopt-nvfp4" };
+ pub const default_context: i64 = engine.default_context;
+ pub const max_segments: u32 = @import("cuda_segments.zig").MAX;
+ pub const prompt_rows: u32 = state.pass_rows;
++pub const max_drafts: u32 = @import("cuda_mtp.zig").max_chain; // Super's; open refuses more than a checkpoint's window holds
+ 
+ pub const Options = struct { context: usize, drafts: bool, segments: usize = 1, slide: bool = false, vision: ?vision.Limits = null, precision: ?@import("config.zig").Precision = null, mtp_drafts: ?u32 = null, mtp_confidence: ?f64 = null };
+ pub const vision = @import("cuda_vision.zig");
+@@ -84,6 +85,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+     errdefer if (carve) |c| closeCarveout(gpa, c);
+     const e = try engine.Engine.init(gpa, io, ctx, dir, kernels, .{ .context = o.context, .mtp = o.drafts, .graphs = true, .sampling = null, .segments = o.segments, .carveout = carve, .slide = o.slide, .vision = o.vision, .precision = o.precision });
+     errdefer e.deinit();
++    if (o.mtp_drafts) |n| if (n >= state.windowRows(e.c)) return error.DraftsPastWindow;
+     const head: ?*Head = if (o.drafts) try Head.init(e) else null;
+     errdefer if (head) |h| h.deinit();
+     if (head) |h| try h.capture();
+@@ -106,7 +108,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
+     return .{
+         .backend = own.lanes.backend(),
+         .facts = own.lanes.facts(),
+-        .rows = if (head != null) state.max_rows else 1,
++        .rows = if (head != null) @intCast(state.windowRows(e.c)) else 1,
+         .stream_bytes = e.seqBytes(),
+         .ctx = own,
+         .deinit = release,
+@@ -132,12 +134,14 @@ fn loneRun(p: *anyopaque, s: *lanes.Stream, hooks: *anyopaque, committed: *const
+ 
+ /// A request this engine refuses, in words; null: none of its own.
+ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
++    const narrow = cuda.qlinear.Affine4Kernels.max_rows; // the one window narrower than max_drafts + 1 rows
+     return switch (err) {
+         error.PromptTooLong => "the prompt and its reply exceed this server's context window: shorten it or lower max_tokens",
+         error.OutOfDeviceMemory => "the GPU had no memory left for this request's caches: retry once another request ends",
+         error.VisionRefused => "--vision: this checkpoint has no image tower the CUDA engine reads (Nemotron Omni's RADIO); serve it without --vision",
+         error.NoVision => "this server reads no images: start it with --vision",
+         error.PrecisionNotBuilt => "--precision checkpoint: NVIDIA's FP4 and FP8 math is built for Nemotron 3.5 Super VL's NVFP4 checkpoint so far; serve this one with --precision full",
++        error.DraftsPastWindow => std.fmt.comptimePrint("--mtp-drafts: this checkpoint verifies windows of {d} rows, so a round drafts {d} at most; serve it with --mtp-drafts {d} or fewer", .{ narrow, narrow - 1, narrow - 1 }),
+         error.CheckpointMathNeedsBlackwell => "--precision checkpoint: NVIDIA's FP4 math runs on Blackwell (compute capability 12.x); serve with --precision full",
+         else => null,
+     };
+diff --git a/zig/src/families/nemotron/cuda_prompt_rows.zig b/zig/src/families/nemotron/cuda_prompt_rows.zig
+index af8aafe8..449e3e08 100644
+--- a/zig/src/families/nemotron/cuda_prompt_rows.zig
++++ b/zig/src/families/nemotron/cuda_prompt_rows.zig
+@@ -5,7 +5,7 @@ const Engine = @import("cuda_engine.zig").Engine;
+ /// Where a prompt pass puts its rows: the next prompt tokens and the kernel's words, host-mapped, and who reads them.
+ pub const PromptRows = struct {
+     k: u8,
+-    rows: usize, // rows a head pass takes: state.max_rows, or batch_rows with a logits buffer of its own
++    rows: usize, // rows a head pass takes: state.windowRows, or batch_rows with a logits buffer of its own
+     logits: u64, // `rows` rows of vocab logits
+     picks: []u32, // host-mapped, `rows` words, at `picks_dev` on the device
+     picks_dev: u64,
+diff --git a/zig/src/families/nemotron/cuda_state.zig b/zig/src/families/nemotron/cuda_state.zig
+index 88c6cb20..ce79cc94 100644
+--- a/zig/src/families/nemotron/cuda_state.zig
++++ b/zig/src/families/nemotron/cuda_state.zig
+@@ -10,12 +10,19 @@ const seq_graphs = @import("cuda_seq_graphs.zig");
+ const latent = @import("cuda_latent.zig");
+ const worker = @import("cuda_worker.zig");
+ 
+-pub const max_rows = 16; // a verify window's rows (the row tile of the row-parallel kernels)
++pub const max_rows = 32; // a verify window's rows at most (the widest row tile of the row-parallel kernels)
+ pub const prefill_rows = 2048; // rows of a staggered segment's chunk, and of a pass under dumps or lessons
+ pub const pass_rows = 2 * prefill_rows; // rows a serial prompt pass runs at most (a row's bits are the same at any cut)
+ pub const yield_rows = 256; // rows of a background pass's chunk: a request that arrives waits for one at most
+ pub const chunk_keys = 512; // keys an attention chunk holds, at fixed absolute positions
+-const shared_words = 2 * max_rows + 8 * max_rows; // the shared expert's members, then (items, counts) a row count
++const shared_rows = cuda.qlinear.Affine4Kernels.max_rows; // rows a shared plan covers (windowRows without a latent MoE)
++const shared_words = 2 * shared_rows + 8 * shared_rows; // the shared expert's members, then (items, counts) a row count
++
++/// A verify window's rows for `c`: max_rows for a latent MoE checkpoint (ModelOpt's projections throughout); every
++/// other one decodes MLX affine-4 projections (Nano's ModelOpt export in its MTP head), whose kernels tile 16 rows.
++pub fn windowRows(c: Config) usize {
++    return if (c.latent > 0) max_rows else cuda.qlinear.Affine4Kernels.max_rows;
++}
+ 
+ /// Sub-allocations of one device allocation, 256-byte aligned like the driver's own.
+ const Arena = struct {
+@@ -75,7 +82,7 @@ pub fn mambaPlanes(c: Config) [2]usize {
+ }
+ 
+ fn seqSizes(c: Config, max_len: usize) [seq_fields.len]usize {
+-    const W: usize = max_rows;
++    const W: usize = windowRows(c);
+     const nm: usize = c.count(.mamba);
+     const kv = c.count(.attention) * max_len * kvRowBytes(c);
+     const cd: usize = c.convDim();
+@@ -93,7 +100,7 @@ fn sharedBytes(c: Config) usize {
+ /// Scratch windows and chunks share on one stream: window logits, chunk io, activations, the expert plan.
+ fn scratchSizes(c: Config, nch: usize) [scratch_count]usize {
+     const R: usize = pass_rows;
+-    const W: usize = max_rows;
++    const W: usize = windowRows(c);
+     const D: usize = c.hidden;
+     const ns: usize = c.slots();
+     const qd: usize = c.heads * c.head_dim;
+@@ -299,7 +306,7 @@ pub const Buffers = struct {
+ 
+     /// The shared expert's plan at `rows` rows: halves `experts` and `experts + 1` over slots top_k and top_k + 1.
+     pub fn sharedPlan(b: *const Buffers, rows: usize) kern.Plan {
+-        const items = b.shared + (2 * max_rows + 8 * @as(u64, rows - 1)) * 4;
++        const items = b.shared + (2 * shared_rows + 8 * @as(u64, rows - 1)) * 4;
+         return .{ .members = b.shared, .items = items, .counts = items + 6 * 4, .rank = 0, .hist = 0 };
+     }
+ 
+@@ -333,14 +340,14 @@ pub const Buffers = struct {
+             return ops.s.synchronize();
+         }
+         var w: [shared_words]u32 = undefined;
+-        for (0..max_rows) |r| {
++        for (0..shared_rows) |r| {
+             w[r] = @intCast(r * c.slots() + c.top_k);
+-            w[max_rows + r] = @intCast(r * c.slots() + c.top_k + 1);
++            w[shared_rows + r] = @intCast(r * c.slots() + c.top_k + 1);
+         }
+-        for (1..max_rows + 1) |rows| {
+-            const at = 2 * max_rows + 8 * (rows - 1);
++        for (1..shared_rows + 1) |rows| {
++            const at = 2 * shared_rows + 8 * (rows - 1);
+             const n: u32 = @intCast(rows);
+-            w[at..][0..8].* = .{ @intCast(c.experts), 0, n, @intCast(c.experts + 1), max_rows, n, 2, 2 };
++            w[at..][0..8].* = .{ @intCast(c.experts), 0, n, @intCast(c.experts + 1), shared_rows, n, 2, 2 };
+         }
+         try ops.upload(b.shared, std.mem.sliceAsBytes(&w));
+         try ops.s.synchronize();
+diff --git a/zig/src/families/nemotron/cuda_train_fwd.zig b/zig/src/families/nemotron/cuda_train_fwd.zig
+index 3b39c309..3ffba5e2 100644
+--- a/zig/src/families/nemotron/cuda_train_fwd.zig
++++ b/zig/src/families/nemotron/cuda_train_fwd.zig
+@@ -76,7 +76,7 @@ pub fn mixer(f: *const fwd.Forward, w: *const fwd.Walk, i: usize, spans: []const
+ 
+ fn mshape(f: *const fwd.Forward) @import("cuda_glue.zig").Shape {
+     const c = f.c;
+-    return .{ .proj = c.projDim(), .xd = c.inner(), .cd = c.convDim(), .heads = c.mamba_heads, .dh = c.mamba_head_dim, .groups = c.groups, .state = c.state, .rmax = state.max_rows };
++    return .{ .proj = c.projDim(), .xd = c.inner(), .cd = c.convDim(), .heads = c.mamba_heads, .dh = c.mamba_head_dim, .groups = c.groups, .state = c.state, .rmax = state.windowRows(c) };
+ }
+ 
+ /// The MoE block (cuda_forward.zig's experts and sharedRest), the pocket's open neurons scaled row by row.
+diff --git a/zig/src/native/cuda_refusal.zig b/zig/src/native/cuda_refusal.zig
+index 32816c58..b62b67eb 100644
+--- a/zig/src/native/cuda_refusal.zig
++++ b/zig/src/native/cuda_refusal.zig
+@@ -5,7 +5,7 @@ const nemotron = @import("nemotron");
+ 
+ /// Flags refused whatever the family; null when `o` may open.
+ pub fn backend(o: api.Open) ?[]const u8 {
+-    if (o.mtp_drafts) |n| if (n > 15) return "--mtp-drafts: the CUDA engine drafts at most 15";
++    if (o.mtp_drafts) |n| if (n > nemotron.native.max_drafts) return std.fmt.comptimePrint("--mtp-drafts: the CUDA engine drafts at most {d}", .{nemotron.native.max_drafts});
+     if (o.mtp_confidence) |c| if (!(c >= 0 and c <= 1)) return "--mtp-confidence must be from 0 to 1";
+     if (o.learn != null and !o.learn_conversations) return "--learn learns shared prompt prefixes on Macs only; CUDA keeps conversation states on disk with --learn-conversations: serve with it, or without --learn, --learn-dir or --learn-gib";
+     if (o.speed_up != null) return "--speed-up links two Macs: serve without --speed-up on CUDA";
+@@ -72,10 +72,10 @@ test "--learn-conversations opens Nemotron only, the one CUDA family whose state
+ }
+ 
+ test "Nemotron CUDA draft controls respect the window and probability bounds" {
+-    for ([_]u32{ 0, 8, 12, 15 }) |n| {
++    for ([_]u32{ 0, 8, 15, 23, 31 }) |n| {
+         try std.testing.expect(backend(.{ .dir = "d", .model_type = "nemotron_h_omni", .mtp_drafts = n }) == null);
+     }
+-    try std.testing.expect(backend(.{ .dir = "d", .model_type = "nemotron_h_omni", .mtp_drafts = 16 }) != null);
++    try std.testing.expect(backend(.{ .dir = "d", .model_type = "nemotron_h_omni", .mtp_drafts = 32 }) != null);
+     for ([_]f64{ 0, 0.5, 1 }) |c| {
+         try std.testing.expect(backend(.{ .dir = "d", .model_type = "nemotron_h_omni", .mtp_confidence = c }) == null);
+     }
+diff --git a/zig/tests/cuda/chunk_costs.zig b/zig/tests/cuda/chunk_costs.zig
+index 25bc70aa..bb0b3b4c 100644
+--- a/zig/tests/cuda/chunk_costs.zig
++++ b/zig/tests/cuda/chunk_costs.zig
+@@ -44,7 +44,7 @@ pub fn run(gpu: check.Gpu, model: []const u8, ids_path: []const u8, widths_text:
+         var window: f64 = std.math.inf(f64);
+         var chunk: f64 = std.math.inf(f64);
+         for (0..reps + 1) |i| {
+-            if (r <= nemotron.state.max_rows) {
++            if (r <= nemotron.state.windowRows(e.c)) {
+                 try restore(e, saved, prompt.len);
+                 _ = try e.step(cont[0], null);
+                 try e.stream.synchronize();
+diff --git a/zig/tests/cuda/main.zig b/zig/tests/cuda/main.zig
+index fe98682c..1d4e5f1a 100644
+--- a/zig/tests/cuda/main.zig
++++ b/zig/tests/cuda/main.zig
+@@ -71,7 +71,7 @@ const usage =
+     \\  radio-attention           the head-dim-80 tower attention's time at five sizes, outputs finite (synthetic rows)
+     \\  window-profile MODEL WIDTHS IDS_FILE   a decode window's GPU ms by kernel class (WIDTHS like 1,4,16), beside its graph
+     \\  tree-accept MODEL IDS_FILE COUNT OUT   a greedy reply's MTP chain and level-1 runner-up branches at every position (JSON)
+-    \\  chunk-costs MODEL IDS_FILE WIDTHS   r rows as the decode window graph (r <= 16) and as a prompt chunk (any r)
++    \\  chunk-costs MODEL IDS_FILE WIDTHS   r rows as the decode window graph (r up to its window) and as a prompt chunk (any r)
+     \\  resume MODEL IDS_FILE     prompt states kept at off-grid rows: each resumed pass against a fresh one, byte for byte
+     \\  marks MODEL IDS_FILE N PATTERNS   states kept inside chunks against chunks cut at the same rows, byte for byte
+     \\  prompt-cuts MODEL IDS_FILE   a prompt keeping states inside chunks and at their ends (background passes too), and resumed from each, equals one uncut pass
+diff --git a/zig/tests/cuda/recapture_tests.zig b/zig/tests/cuda/recapture_tests.zig
+index cfb756f1..f0ad4530 100644
+--- a/zig/tests/cuda/recapture_tests.zig
++++ b/zig/tests/cuda/recapture_tests.zig
+@@ -38,7 +38,7 @@ pub fn run(gpu: check.Gpu, model: []const u8) !void {
+     try e.captureWindows();
+     try e.setSampling(null);
+     try check.expect(
+-        held(e, 0) == nemotron.state.max_rows and held(e, 1) == nemotron.state.max_rows,
++        held(e, 0) == nemotron.state.windowRows(e.c) and held(e, 1) == nemotron.state.windowRows(e.c),
+         "windows held: {d} greedy, {d} sampled",
+         .{ held(e, 0), held(e, 1) },
+     );
+diff --git a/zig/tests/cuda/window_profile.zig b/zig/tests/cuda/window_profile.zig
+index 5bf86407..5b4995d7 100644
+--- a/zig/tests/cuda/window_profile.zig
++++ b/zig/tests/cuda/window_profile.zig
+@@ -45,7 +45,7 @@ pub fn run(gpu: check.Gpu, model: []const u8, widths_text: []const u8, ids_path:
+ 
+ /// Graph ms and eager class ms for each width, shared expert forked and on one stream, as medians of 5.
+ fn profile(gpa: std.mem.Allocator, e: *nemotron.Engine, ids: []const u32, widths: []const usize) !void {
+-    const most = nemotron.state.max_rows;
++    const most = nemotron.state.windowRows(e.c);
+     if (ids.len < most + 2) return error.PromptTooShort;
+     const prompt = ids[0 .. ids.len - most - 1];
+     const cont = ids[prompt.len..];
+-- 
+2.43.0
+

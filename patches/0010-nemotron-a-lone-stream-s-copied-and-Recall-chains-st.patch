@@ -1,0 +1,79 @@
+From d0deb8a6cd7cf3d1c7de64e27fe85c8286a13931 Mon Sep 17 00:00:00 2001
+From: plotarmordev <299844489+plotarmordev@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 02:38:37 +0800
+Subject: [PATCH 10/18] nemotron: a lone stream's copied and Recall chains
+ start at 15 tokens and grow with what copies keep
+
+A copied chain is verified whole, without the depth rule's pricing, and with 32-row windows it took up to 31 tokens
+of the context's continuation: a wrong copy then cost a 32-row window, 167.3 ms in a GB10's cost table where 16 rows
+cost 125.4. On a GB10 the harness's tool_json fell from 58.7 to 41.1 tok/s, repetition from 48.9 to 41.3 and
+long_document from 32.5 to 27.4 against stock. A copy now proposes at least 15 tokens (a 16-row window's) and after
+each copy round at most twice the tokens that round kept, up to the window's 31. Paired on a GB10 against 31-token
+copies (15-token copies in brackets): tool_json 67.1 tok/s against 45.5 (64.1), repetition 54.3 against 47.0 (54.3),
+long_document 39.2 against 31.0 (39.2), image 72.3 against 75.3 (68.4).
+---
+ zig/src/families/nemotron/cuda_drafts.zig | 23 ++++++++++++++++++++++-
+ 1 file changed, 22 insertions(+), 1 deletion(-)
+
+diff --git a/zig/src/families/nemotron/cuda_drafts.zig b/zig/src/families/nemotron/cuda_drafts.zig
+index 66ad3139..6ef2f965 100644
+--- a/zig/src/families/nemotron/cuda_drafts.zig
++++ b/zig/src/families/nemotron/cuda_drafts.zig
+@@ -12,6 +12,16 @@ const DepthRule = core.draft_depth.DepthRule;
+ 
+ pub const Stats = struct { rounds: usize = 0, drafted: usize = 0, accepted: usize = 0 };
+ 
++/// Tokens a copied or Recall chain proposes at least, unpriced by the depth rule: a 16-row window's, where a wrong
++/// copy's rows cost little.
++const copy_chain = 15;
++
++/// The next copy's room after a copy round kept `rows` rows (its pending one too): twice the copy that landed, from
++/// copy_chain up to the drafts of a `window`-row window.
++fn copyRoom(rows: usize, window: usize) usize {
++    return std.math.clamp(2 * (rows - 1), copy_chain, window - 1);
++}
++
+ /// Start a round's head work: an absorb for a copied chain, else level 1 (the rule reads the later levels).
+ fn queue(h: *Head, keep: usize, copied: bool) !void {
+     try h.begin(keep);
+@@ -54,6 +64,7 @@ pub const Rounds = struct {
+     recalled: bool = false, // the copy came from Recall
+     proposal: []const u32 = &.{},
+     copy_round: bool = false,
++    copy_room: usize = copy_chain,
+     st: Stats = .{},
+ 
+     /// The head reads the prompt's last hidden row and final output token.
+@@ -106,7 +117,7 @@ pub const Rounds = struct {
+     /// The context's own copied chain, else Recall's continuation when it is expected to pay (in `cbuf`).
+     fn copies(r: *Rounds) []const u32 {
+         r.recalled = false;
+-        const room = r.cbuf[0 .. state.windowRows(r.e.c) - 1];
++        const room = r.cbuf[0..r.copy_room];
+         const own = r.index.chain(room);
+         const x = r.recall orelse return own;
+         if (own.len > 0) return own;
+@@ -156,6 +167,7 @@ pub const Rounds = struct {
+         r.st.rounds += 1;
+         r.st.drafted += r.proposal.len;
+         r.st.accepted += n - 1;
++        if (r.copy_round) r.copy_room = copyRoom(n, state.windowRows(r.e.c));
+         if (!more) return;
+         r.copied = r.copies();
+         try queue(r.h, n, r.copied.len > 0);
+@@ -211,3 +223,12 @@ pub const Drafter = struct {
+ pub fn depthRule(c: core.draft_depth.Costs) DepthRule {
+     return DepthRule.init(c, c.rows - 1, null, 2.0);
+ }
++
++test "a copy's room grows with what the last copy kept, from 15 tokens to the window's drafts" {
++    try std.testing.expectEqual(@as(usize, 15), copyRoom(1, 32));
++    try std.testing.expectEqual(@as(usize, 15), copyRoom(8, 32));
++    try std.testing.expectEqual(@as(usize, 16), copyRoom(9, 32));
++    try std.testing.expectEqual(@as(usize, 31), copyRoom(17, 32));
++    try std.testing.expectEqual(@as(usize, 31), copyRoom(32, 32));
++    try std.testing.expectEqual(@as(usize, 15), copyRoom(16, 16));
++}
+-- 
+2.43.0
+
