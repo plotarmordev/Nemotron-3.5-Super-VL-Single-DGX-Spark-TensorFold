@@ -223,4 +223,4 @@ The recipe is [MIT](LICENSE). Its scripts follow
 [`patches/NOTICE`](patches/NOTICE)). The model is under NVIDIA's [OpenMDW License 1.1](https://openmdw.ai/license/1-1/)
 and is downloaded, never redistributed.
 
-[Credits](CREDITS.md) · [Patches](patches) · [Settings](scripts/config.sh) · [MIT license](LICENSE)
+[Credits](CREDITS.md) · [Patches](patches) · [Settings](scripts/config.sh) · [Contributing](CONTRIBUTING.md) · [MIT license](LICENSE)

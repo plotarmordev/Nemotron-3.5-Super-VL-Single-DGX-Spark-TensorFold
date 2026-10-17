@@ -1,0 +1,26 @@
+name: Performance claim
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions: {}
+
+jobs:
+  section:
+    runs-on: ubuntu-latest
+    steps:
+      # The body is read from the event file, never expanded into the script.
+      - run: |
+          if ! section=$(jq -r '
+              .pull_request.body | gsub("\r"; "") | gsub("<!--[\\s\\S]*?-->"; "") | split("\n")
+              | .[(map(sub("[ \t]+\\z"; "")) | index("## Performance claim") // error) + 1:]
+              | .[:map(startswith("## ")) | index(true)] | join("\n")
+              | gsub("\\A\\s+|\\s+\\z"; "")' "$GITHUB_EVENT_PATH" 2>/dev/null); then
+            echo "::error::The description has no '## Performance claim' section (see CONTRIBUTING.md)."
+            exit 1
+          fi
+          if [[ $section != None. && $section != *"MEASURED FASTER"* && $section != *'```'* && $section != *'~~~'* ]]; then
+            echo "::error::Performance claim must say None., or hold MEASURED FASTER or raw output in a fenced code block (see CONTRIBUTING.md)."
+            exit 1
+          fi
