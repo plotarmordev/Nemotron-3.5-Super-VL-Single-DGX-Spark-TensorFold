@@ -3,31 +3,30 @@
 Read the [README](README.md) and [`scripts/config.sh`](scripts/config.sh) first, then fill in the pull request
 template.
 
-## Patches
+## Engine changes
 
-The README promises replies token for token the same as stock TensorFold's. A pull request that changes `patches/`
-keeps that promise: boot `main` and the pull request as in [Baseline](#baseline), run `tools/bench.py decode` on
-each, and paste both outputs into Testing. Every `token_sha256` must be the same on both.
+Engine changes go upstream to [TensorFold](https://github.com/ashhart/TensorFold), as this recipe's own did; the
+recipe serves its stock release.
 
 ## Performance claims
 
 Most pull requests need nothing extra. A pull request that **claims a speed improvement** brings raw numbers
 measured against the recipe's baseline, so maintainers can judge the claim without re-testing it.
 
-**What counts as a claim:** saying the change makes the recipe faster (in the title, description, a patch message
-or your own comments), changing a number in the README, or changing a default, an option or a patch because it is
-faster. No claim, no measurement. If the numbers don't support the claim, drop the claim; the pull request can
-still be opened.
+**What counts as a claim:** saying the change makes the recipe faster (in the title, description, a commit
+message or your own comments), changing a number in the README, or changing a default, an option or the engine
+release because it is faster. No claim, no measurement. If the numbers don't support the claim, drop the claim;
+the pull request can still be opened.
 
 ### Baseline
 
 Every run uses the recipe's defaults on one DGX Spark, so numbers from different contributors compare:
 
-- No `.env`, or one that only says where things are on your Spark: `MODEL_DIR`, `TF_HOME`, `ZIG`, `NVCC`, and
-  `TF_ARCHIVE` or `TF_SRC` on a Spark without GitHub.
+- No `.env`, or one that only says where things are on your Spark: `MODEL_DIR`, `TF_HOME`, and `TF_ARCHIVE` on a
+  Spark without GitHub.
 - A shell with none of the recipe's variables exported (`scripts/config.sh` lists them), and no `TF_*` or
   `TENSORFOLD_*`: exports override `.env` and the defaults, and reach the engine.
-- `./start.sh` with no arguments, from that checkout: it builds the checkout's `patches/`.
+- `./start.sh` with no arguments, from that checkout: it serves the TensorFold release the checkout pins.
 - Nothing else running on the GPU.
 
 A claim about other settings (for example `VISION=0`) uses them on every run instead. Say so in the declarations.
@@ -35,10 +34,10 @@ A claim about other settings (for example `VISION=0`) uses them on every run ins
 ### Speed claims the Grill measures
 
 The Grill measures generation speed on a short counting prompt (temperature 0, thinking off, 400 output tokens per
-request), either one request at a time (`portable-v1`; the README's Stock vs this recipe table is its result) or
-with 2, 4 or 8 requests at once (`portable-c2-v1`, `portable-c4-v1`, `portable-c8-v1`, verdict on their combined
-tokens per second). A claim about either ("faster decode", "+N% tok/s", "+N% at 4 requests at once") is measured
-with the newest release of
+request), either one request at a time (`portable-v1`) or with 2, 4 or 8 requests at once (`portable-c2-v1`,
+`portable-c4-v1`, `portable-c8-v1`, verdict on their combined tokens per second); the README's Stock vs this recipe
+table is its result for `portable-v1`, `portable-c4-v1` and `portable-c8-v1`. A claim about either ("faster decode",
+"+N% tok/s", "+N% at 4 requests at once") is measured with the newest release of
 [The Grill](https://github.com/plotarmordev/thegrill/releases) (the highest version listed, pre-releases included;
 0.8.0 or later). Install it as its
 [install guide](https://github.com/plotarmordev/thegrill/blob/main/docs/performance/INSTALL.md#obtain-verify-unpack)
@@ -61,7 +60,7 @@ For a new opt-in option, all three runs use your pull request: A and A2 without 
 
 Write one declaration for each side, `a.json` and `b.json`. `runtime` is the checkout's `git rev-parse HEAD`.
 `settings` is `baseline` (the checkout's `scripts/config.sh` defaults), plus the option on B for an option claim,
-plus the settings on both for a claim at other settings. The two files differ only in `runtime` (a code, patch or
+plus the settings on both for a claim at other settings. The two files differ only in `runtime` (a code, release or
 default change) or only in `settings` (an option); the Grill refuses B otherwise.
 
 ```json
@@ -78,7 +77,7 @@ On the Spark, with `ENDPOINT=http://127.0.0.1:8888/v1/chat/completions`, `MODEL=
 # A
 grill-perf baseline --workload "$WORKLOAD" --client-placement same-host \
   --endpoint "$ENDPOINT" --local-http --model "$MODEL" --deployment a.json --out A
-# B: --change runtime for a code, patch or default change, --change settings for an option
+# B: --change runtime for a code, release or default change, --change settings for an option
 grill-perf check A --change runtime --deployment b.json --out B
 # A2 (its own exit code doesn't matter)
 grill-perf check A --change none --deployment A/deployment.json --out A2
