@@ -5,10 +5,10 @@
 [![CUDA 13](https://img.shields.io/badge/CUDA-13-76b900?style=flat-square)](#quickstart)
 [![model: Nemotron 3.5 Super VL NVFP4](https://img.shields.io/badge/model-Nemotron_3.5_Super_VL_NVFP4-8250df?style=flat-square)](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4)
 [![engine: TensorFold 1.1.0](https://img.shields.io/badge/engine-TensorFold_1.1.0-57606a?style=flat-square)](#engine-changes-now-in-tensorfold-110)
-[![status: +20% on one workload](https://img.shields.io/badge/status-%2B20%25_on_one_workload-a16207?style=flat-square)](#stock-vs-this-recipe)
+[![status: +18.5% one at a time, +29% at 8](https://img.shields.io/badge/status-%2B18.5%25_one_at_a_time%2C_%2B29%25_at_8-a16207?style=flat-square)](#stock-vs-this-recipe)
 
-**NVIDIA's 120B vision-language model on one DGX Spark: 20% faster than stock TensorFold on a one-request counting
-test, with the same replies.**
+**NVIDIA's 120B vision-language model on one DGX Spark: 18.5% faster than stock TensorFold 1.0.12 one request at a
+time and 29% faster with 8 at once on a counting test, with the same replies.**
 
 This recipe serves Nemotron 3.5 Super VL from NVIDIA's NVFP4 checkpoint with stock
 [TensorFold](https://github.com/ashhart/TensorFold) 1.1.0's native CUDA engine, which now ships the 16 engine changes
@@ -25,43 +25,42 @@ each. The weights are not in this repository: you download them from
 
 ## Stock vs this recipe
 
-Measured with [the Grill](https://github.com/plotarmordev/thegrill) on one DGX Spark: greedy, thinking off, 400
-tokens of counting from 1 to 1,000 per request, one request at a time (Grill 0.6.0) and 4 or 8 at once (Grill
-0.8.0, combined tok/s). Stock ran before and after the recipe.
+Measured with [the Grill](https://github.com/plotarmordev/thegrill) 0.8.0 on one DGX Spark: greedy, thinking off,
+400 tokens of counting from 1 to 1,000 per request, one request at a time and 4 or 8 at once (combined tok/s). Stock
+TensorFold 1.0.12 ran before and after this recipe on TensorFold 1.1.0, each at its own defaults.
 
 | | Stock TensorFold 1.0.12 | This recipe | Stock again |
 |---|---:|---:|---:|
-| 1 at a time, median tok/s (8 runs each) | 75.43 | **90.96** | 75.83 |
-| Change | | **+20.6%** ![Measured faster](https://img.shields.io/badge/measured_faster-1a7f37?style=flat-square) | stock drift +0.5% |
-| 4 at once, median combined tok/s | 150.14 | **196.26** | 149.50 |
-| Change | | **+26.8%** ![Measured faster](https://img.shields.io/badge/measured_faster-1a7f37?style=flat-square) | stock drift −2.5% |
-| 8 at once, median combined tok/s | 177.65 | **239.95** | 168.89 |
-| Change | | **+41.0%** ![Measured faster](https://img.shields.io/badge/measured_faster-1a7f37?style=flat-square) | stock drift −2.6% |
+| 1 at a time, median tok/s (8 runs each) | 77.3 | **96.2** | 75.8 |
+| Change | | **+18.5%** ![Measured faster](https://img.shields.io/badge/measured_faster-1a7f37?style=flat-square) | stock drift −1.9% |
+| 4 at once, median combined tok/s | 127.1 | 168.8 | 149.5 |
+| Change | | +11% to +27% ![Too close to call](https://img.shields.io/badge/too_close_to_call-a16207?style=flat-square) | stock drift +14.9% |
+| 8 at once, median combined tok/s | 146.4 | **213.2** | 160.3 |
+| Change | | **+29%** ![Measured faster](https://img.shields.io/badge/measured_faster-1a7f37?style=flat-square) | stock drift +13.8% |
 
-Every measured reply was the same text in both deployments: 24 one at a time (and its 8 warm-ups), 96 at 4 at
-once, 192 at 8 at once.
+Every measured reply was the same text in both deployments: 24 one at a time, 96 at 4 at once, 192 at 8 at once.
 
 <details>
 <summary>What this number doesn't show</summary>
 
 - **One workload:** one counting prompt, sent to every request when several run at once. Counting is very
-  predictable, so speculative decoding (drafting) does most of the work. Quote "+20% one at a time, +27% at 4 and
-  +41% at 8 on this workload", not a general speedup.
+  predictable, so speculative decoding (drafting) does most of the work. Quote "+18.5% one at a time and +29% at 8
+  on this workload", not a general speedup. At 4 at once no gain is established.
 - **Not covered:** images, long prompts, more than 8 requests at once.
-- **Different settings:** the recipe also serves a 131,072-token window where stock serves 16,384, so the gains
-  can't be credited to the patches alone; More measurements compares both at the same settings.
-- **Statistics:** one at a time, +20.56% over the first stock run (95% interval +20.43 to +20.69) and +19.99% over
-  the second (+19.87 to +20.10). At 4 at once, +26.84% (+10.25 to +45.94) and +30.09% (+12.07 to +50.99); at 8,
-  +41.04% (+23.33 to +61.29) and +44.78% (+26.59 to +65.59). Each change is the Grill's estimate over all 8 runs
-  (log scale), not the ratio of the medians shown. The intervals are model-based and may be too narrow for runs
-  made one after another.
-- **Wider spread when several run at once:** at 4 at once the recipe's runs ranged from 142 to 221 combined tok/s
-  (most near 173 or 220), and the engines' thermal guard paused each deployment about 30 times (2 or 4 s each)
-  during these runs. Those intervals are much wider than one at a time; the gains are still above zero against
-  both stock runs.
-- **Startup tuning:** at its first start the engine times its drafting options and saves the result; the one at
-  a time runs reused a saved table. Fresh starts of an earlier build counted at 92.2 to 95.9 tok/s one at a time
-  (7 starts).
+- **Whole deployments:** stock ran at its defaults (a 16,384-token window), the recipe at its own (131,072 tokens,
+  images on), so this compares deployments, not engines; More measurements compares the engines at the same
+  settings.
+- **Statistics:** one at a time, +18.50% over the first stock run (95% interval +5.53 to +33.06) and +20.84% over
+  the second (+7.62 to +35.69). At 4 at once, +27.09% (+2.40 to +57.73) and +10.62% (−7.91 to +32.88), so the
+  Grill calls it too close to call. At 8, +46.93% (+37.14 to +57.42) and +29.12% (+20.89 to +37.90); +29% is the
+  smaller. Each change is the Grill's estimate over all 8 runs (log scale), not the ratio of the medians shown. The
+  intervals are model-based and may be too narrow for runs made one after another.
+- **Heat pauses and spread:** the engines' thermal guard (85/75 °C) paused prompts 27 to 47 times in each run
+  window. One recipe run one at a time counted 65.0 tok/s (the others 95.7 to 96.4). At 4 at once both deployments
+  switched between two levels (stock 110 to 151, the recipe 135 or 203 combined tok/s), and stock moved 14 to 15%
+  between its two runs at 4 and at 8.
+- **Startup tuning:** at its first start the engine times its drafting options and saves the result; which table a
+  start finds can move counting by a few percent.
 - **Run details:** 8 runs per deployment, all complete: 32 of 32 requests (12,800 tokens) one at a time, 128 of
   128 (51,200 tokens) at 4 at once and 256 of 256 (102,400 tokens) at 8, for stock, the recipe and stock again.
 
@@ -70,38 +69,40 @@ once, 192 at 8 at once.
 <details>
 <summary>More measurements</summary>
 
-Stock TensorFold 1.0.12 built from source with the same toolchain, against this recipe's build, on one DGX Spark,
-both at the recipe's settings. Medians of 3 requests after a warmup, server-reported decode tok/s, 256-token replies
-(400 for counting). Every reply's token hash equals stock's.
+Stock TensorFold 1.0.12 against this recipe on TensorFold 1.1.0, both release binaries, on one DGX Spark, both at the
+recipe's settings. Two runs of each, alternated, each from a cool, idle box; the mean of their medians of 3 requests
+after a warmup, server-reported decode tok/s, 256-token replies (400 for counting). Every reply's token hash equals
+stock's.
 
 | Measure | Stock | Recipe | Change |
 |---|---:|---:|---:|
-| Counting, drafted | 75.86 | 92.72 | +22% |
-| Short story, drafted | 29.28 | 34.52 | +18% |
-| Python code, drafted | 43.91 | 51.42 | +17% |
-| Describing an image, drafted | 59.88 | 71.88 | +20% |
-| English essay, drafted | 29.73 | 35.22 | +18% |
-| Spanish essay, drafted | 31.62 | 35.16 | +11% |
-| French essay, drafted | 29.22 | 33.34 | +14% |
-| German essay, drafted | 29.44 | 33.11 | +12% |
-| Italian essay, drafted | 33.21 | 36.83 | +11% |
-| Japanese essay, drafted | 38.50 | 43.50 | +13% |
-| Counting, `"draft": false` | 18.49 | 21.44 | +16% |
-| 1 request, total tok/s | 43.93 | 51.46 | +17% |
-| 2 requests at once, total tok/s | 41.05 | 47.32 | +15% |
-| 4 requests at once, total tok/s | 57.10 | 64.97 | +14% |
-| 8 requests at once, total tok/s | 68.69 | 87.57 | +28% |
-| First token, 2,048-token prompt | 1.22 s | 0.91 s | −26% |
-| First token, 8,192-token prompt | 4.45 s | 3.08 s | −31% |
-| First token, 16,384-token prompt | 13.25 s | 8.96 s | −32% |
+| Counting, drafted | 75.14 | 97.12 | +29% |
+| Short story, drafted | 28.99 | 34.11 | +18% |
+| Python code, drafted | 42.79 | 51.91 | +21% |
+| Describing an image, drafted | 59.41 | 70.04 | +18% |
+| English essay, drafted | 29.21 | 34.64 | +19% |
+| Spanish essay, drafted | 31.18 | 35.34 | +13% |
+| French essay, drafted | 28.81 | 32.89 | +14% |
+| German essay, drafted | 29.02 | 32.84 | +13% |
+| Italian essay, drafted | 32.55 | 36.34 | +12% |
+| Japanese essay, drafted | 38.03 | 43.39 | +14% |
+| Counting, `"draft": false` | 18.31 | 21.14 | +15% |
+| 1 request, total tok/s | 42.77 | 51.90 | +21% |
+| 2 requests at once, total tok/s | 42.15 | 46.85 | +11% |
+| 4 requests at once, total tok/s | 56.53 | 64.48 | +14% |
+| 8 requests at once, total tok/s | 68.36 | 89.19 | +30% |
+| First token, 2,048-token prompt | 1.21 s | 0.90 s | −26% |
+| First token, 8,192-token prompt | 4.42 s | 3.06 s | −31% |
+| First token, 16,384-token prompt | 13.22 s | 8.95 s | −32% |
 
-- **Drafting off:** counting, a multilingual prompt and the six essays were also sent with `"draft": false` and
-  gave the same hashes. Concurrent requests equalled their solo runs.
+- **Drafting off:** every drafted prompt above, and a multilingual one, was also sent with `"draft": false` and gave
+  the same hash. Concurrent requests equalled their solo runs.
+- **Heat pauses:** decode tok/s counts from the first token, so the thermal guard's pauses on prompts don't touch
+  it; a run whose pause fell in a timed concurrent run or a 2k or 8k prompt was measured again.
 - **First token:** cold prompts on a server with `--context 18432 --prompt-cache-gib 0`, the host cooled to 75 °C
-  before each. The thermal guard still paused every 16k prompt (stock 6 s, recipe 4 s), and that row includes the
-  pauses.
-- **Second Spark:** a broader harness gave stock's tokens on 10 greedy prompts (one with an image), seeded sampled
-  prose and code, 1/2/4/8 concurrent requests and resumed prompts.
+  before each. The guard still paused almost every 16k prompt (stock 4 to 6 s, the recipe 0 to 4 s), and that row
+  includes the pauses. Less the pauses the guard logged: 7.22 s against 4.95 s (−31%); the recipe's one 16k prompt
+  without a pause took 6.29 s.
 - **Reproduce:** `tools/bench.py decode` (add a prompt name, e.g. `decode count`, for one prompt), `streams`, and
   `ttft` on a server restarted with
   `VISION=0 ./start.sh restart --context 18432 --parallel 1 --segments 1 --prompt-cache-gib 0`.
@@ -139,7 +140,7 @@ flags after `./start.sh`. All of them are in [`scripts/config.sh`](scripts/confi
 | `PARALLEL` | `auto` | Requests decoded together, up to 8 |
 | `VISION` | `1` | Load the image tower (~2.2 GiB) |
 | `THINKING` | `1` | Reason before answering; a request's `enable_thinking` wins |
-| `MTP_DRAFTS` / `MTP_CONFIDENCE` | empty | Override the drafting depth; `15` / `0.5` measured +10% on counting and −2.5% on code (earlier build) |
+| `MTP_DRAFTS` / `MTP_CONFIDENCE` | empty | Override the drafting depth; `15` / `0.5` suited counting and repetition on the patched 1.0.12, not yet measured on 1.1.0 |
 | `PORT` / `HOST` | `8888` / `0.0.0.0` | Where the API listens |
 | `MODEL_DIR` | `~/models/nemotron-3.5-super-vl-nvfp4` | The checkpoint folder |
 | `TF_HEAT_HIGH` / `TF_HEAT_LOW` | `85` / `75` | Thermal guard (°C): a prompt chunk waits while the board is hotter |
