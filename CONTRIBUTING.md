@@ -36,9 +36,9 @@ A claim about other settings (for example `VISION=0`) uses them on every run ins
 
 The Grill measures generation speed on a short counting prompt (temperature 0, thinking off, 400 output tokens per
 request), either one request at a time (`portable-v1`; the README's Stock vs this recipe table is its result) or
-with 2, 4 or 8 requests at once (`portable-c2-v1`, `portable-c4-v1`,
-`portable-c8-v1`, verdict on their combined tokens per second). A claim about either ("faster decode", "+N% tok/s",
-"+N% at 4 requests at once") is measured with the newest release of
+with 2, 4 or 8 requests at once (`portable-c2-v1`, `portable-c4-v1`, `portable-c8-v1`, verdict on their combined
+tokens per second). A claim about either ("faster decode", "+N% tok/s", "+N% at 4 requests at once") is measured
+with the newest release of
 [The Grill](https://github.com/plotarmordev/thegrill/releases) (the highest version listed, pre-releases included;
 0.8.0 or later). Install it as its
 [install guide](https://github.com/plotarmordev/thegrill/blob/main/docs/performance/INSTALL.md#obtain-verify-unpack)
