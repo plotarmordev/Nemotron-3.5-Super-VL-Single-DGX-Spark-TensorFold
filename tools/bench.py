@@ -14,7 +14,8 @@
       VISION=0 ./start.sh restart --context 18432 --parallel 1 --segments 1 --prompt-cache-gib 0
   tools/bench.py image-ttft
       cold prompts with 1 and 4 generated 2048 x 1664 PNGs, 32 tokens "draft": false: a warmup and 3 each.
-      Start with --vision --context 18432 --parallel 1 --prompt-cache-gib 0; cached rows are refused.
+      Start with --vision --vision-image-tokens 13312 --vision-max-images 4 --context 18432 --parallel 1
+      --prompt-cache-gib 0; cached rows are refused. Cold means uncached prompt rows, not a cold server.
 
 Every request is greedy, thinking off and streamed. Before a timed request, a hottest thermal zone above
 TF_HEAT_HIGH (85) is let cool to TF_HEAT_LOW (75), so the server's own thermal guard does not pause it; both TTFT modes
