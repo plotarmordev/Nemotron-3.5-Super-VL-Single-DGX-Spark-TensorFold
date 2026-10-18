@@ -32,19 +32,22 @@ Every run uses the recipe's defaults on one DGX Spark, so numbers from different
 
 A claim about other settings (for example `VISION=0`) uses them on every run instead. Say so in the declarations.
 
-### Single-request speed claims: the Grill
+### Speed claims the Grill measures
 
-The Grill measures generation speed for one request at a time: a short counting prompt, temperature 0, thinking
-off, 400 output tokens, timed from request to last token; the README's Stock vs this recipe table is its result. A
-claim about that ("faster decode", "+N% tok/s") is measured with the newest release of
+The Grill measures generation speed on a short counting prompt (temperature 0, thinking off, 400 output tokens per
+request), either one request at a time (`portable-v1`; the README's Stock vs this recipe table is its result) or
+with 2, 4 or 8 requests at once (`portable-c2-v1`, `portable-c4-v1`,
+`portable-c8-v1`, verdict on their combined tokens per second). A claim about either ("faster decode", "+N% tok/s",
+"+N% at 4 requests at once") is measured with the newest release of
 [The Grill](https://github.com/plotarmordev/thegrill/releases) (the highest version listed, pre-releases included;
-0.7.0 or later). Install it as its
+0.8.0 or later). Install it as its
 [install guide](https://github.com/plotarmordev/thegrill/blob/main/docs/performance/INSTALL.md#obtain-verify-unpack)
-shows, checksum included.
+shows, checksum included. State the concurrency level in the claim before you measure, and use that one workload
+for all three runs.
 
-Claims the Grill doesn't measure (cold prefill, concurrency, prose, images) use [`tools/bench.py`](tools/bench.py)
-instead, on `main` and on the pull request booted the same way (`ttft` with the server settings its usage names).
-Paste both raw outputs into the Performance claim section in a fenced code block.
+Claims the Grill doesn't measure (cold prefill, prose, images) use [`tools/bench.py`](tools/bench.py) instead, on
+`main` and on the pull request booted the same way (`ttft` with the server settings its usage names). Paste both
+raw outputs into the Performance claim section in a fenced code block.
 
 Take three runs. Before each one: `./stop.sh`, check out the commit, `./start.sh`.
 
@@ -68,11 +71,12 @@ default change) or only in `settings` (an option); the Grill refuses B otherwise
  "settings": "baseline"}
 ```
 
-On the Spark, with `ENDPOINT=http://127.0.0.1:8888/v1/chat/completions` and `MODEL=nemotron-3.5-super-vl`:
+On the Spark, with `ENDPOINT=http://127.0.0.1:8888/v1/chat/completions`, `MODEL=nemotron-3.5-super-vl` and
+`WORKLOAD` set to the claim's workload (`portable-v1`, or `portable-c2-v1`/`-c4-v1`/`-c8-v1`):
 
 ```sh
 # A
-grill-perf baseline --workload portable-v1 --client-placement same-host \
+grill-perf baseline --workload "$WORKLOAD" --client-placement same-host \
   --endpoint "$ENDPOINT" --local-http --model "$MODEL" --deployment a.json --out A
 # B: --change runtime for a code, patch or default change, --change settings for an option
 grill-perf check A --change runtime --deployment b.json --out B
@@ -86,7 +90,8 @@ grill-perf compare A B --reference A2 --json > qualification.json
 B and A2 reuse A's endpoint, model and placement, and must be measured by the same Grill binary as A.
 
 Each run must start at least 60 seconds after the previous one finished; a boot usually covers that. If a run
-needs more than five minutes, pass the same `--seconds N` to all three.
+needs more than five minutes, pass the same `--seconds N` to all three. The concurrent workloads ask for up to
+102,400 tokens per run, so on one Spark use `--seconds 1800` for them; it is a ceiling, not a target.
 
 **The claim stands only if `compare` prints `MEASURED FASTER`:** B is faster than both A and A2. Quote the measured
 change, not a bigger number. Anything else, drop the claim. If you push code after measuring, measure again.
@@ -105,7 +110,7 @@ jq -r --slurpfile a2 A2/report.json '
   "B:        \($d.candidate.declaration | .runtime + "; " + .settings)",
   "result:   \(.result)",
   "B vs A:   \(leg)    B vs A2: \($d.candidate_against_reference | leg)    A2 vs A: \($d.reference_against_baseline | leg)",
-  "complete: A \(.baseline_accounting.complete_requests)/32, B \(.candidate_accounting.complete_requests)/32, A2 \($a2[0].candidate_accounting.complete_requests)/32",
+  "complete: A \(.baseline_accounting.complete_requests)/\(.baseline_accounting.request_ceiling), B \(.candidate_accounting.complete_requests)/\(.candidate_accounting.request_ceiling), A2 \($a2[0].candidate_accounting.complete_requests)/\($a2[0].candidate_accounting.request_ceiling)",
   "tok/s A:  \(.baseline_acquisition_medians | rounds)",
   "tok/s B:  \(.candidate_acquisition_medians | rounds)",
   "tok/s A2: \($a2[0].candidate_acquisition_medians | rounds)"' qualification.json
