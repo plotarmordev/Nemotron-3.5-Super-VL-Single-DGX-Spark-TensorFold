@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # Serve NVIDIA Nemotron 3.5 Super VL (nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4) with TensorFold on one
 # DGX Spark, end to end: runs scripts/prepare.sh when the engine or the checkpoint is not ready yet (first run, or
-# after settings or patches change), launches `tensorfold-native serve` as the systemd user unit $UNIT, waits until
+# after settings change), launches `tensorfold-native serve` as the systemd user unit $UNIT, waits until
 # the OpenAI API answers, then runs a smoke test. Stop it with ./stop.sh.
 #
 # Usage: ./start.sh [restart] [extra tensorfold serve args]
 #   ./start.sh                         # scripts/config.sh defaults: 131,072-token window, up to 8 streams, images on
 #                                      # (if the server already runs, says so and leaves it alone)
 #   ./start.sh restart                 # stop the running server (./stop.sh), then start it again, e.g. to apply
-#                                      # changed settings or patches; the new arguments are checked before stopping
+#                                      # changed settings; the new arguments are checked before stopping
 #   ./start.sh restart --context 32768
 #   VISION=0 THINKING=0 ./start.sh restart
 # Extra arguments come after the defaults, so they win (the last value of a flag counts).
@@ -83,8 +83,8 @@ if [[ "$MODE" == start ]] && running; then
 fi
 
 # ---------------------------------------------------------------- 1. setup
-# scripts/prepare.sh runs whenever what it last prepared differs from now: the first run, new patches, another
-# release or checkpoint. PREPARE=1 forces it, PREPARE=0 skips it. A checkpoint already hashed is not hashed again.
+# scripts/prepare.sh runs whenever what it last prepared differs from now: the first run, another release or
+# checkpoint. PREPARE=1 forces it, PREPARE=0 skips it. A checkpoint already hashed is not hashed again.
 step 1 "Setup: engine and checkpoint"
 if [[ "${PREPARE:-auto}" == 1 || ( "${PREPARE:-auto}" != 0 && "$(prepared_state)" != "$(cat "$PREPARED_MARKER" 2>/dev/null)" ) ]]; then
   prepare_args=()
