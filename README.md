@@ -4,23 +4,24 @@
 [![platform: DGX Spark GB10](https://img.shields.io/badge/platform-DGX_Spark_GB10-76b900?style=flat-square)](#quickstart)
 [![CUDA 13](https://img.shields.io/badge/CUDA-13-76b900?style=flat-square)](#quickstart)
 [![model: Nemotron 3.5 Super VL NVFP4](https://img.shields.io/badge/model-Nemotron_3.5_Super_VL_NVFP4-8250df?style=flat-square)](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4)
-[![engine: TensorFold 1.0.12 + 18 patches](https://img.shields.io/badge/engine-TensorFold_1.0.12_%2B_18_patches-57606a?style=flat-square)](#what-the-patches-change)
+[![engine: TensorFold 1.1.0](https://img.shields.io/badge/engine-TensorFold_1.1.0-57606a?style=flat-square)](#engine-changes-now-in-tensorfold-110)
 [![status: +20% on one workload](https://img.shields.io/badge/status-%2B20%25_on_one_workload-a16207?style=flat-square)](#stock-vs-this-recipe)
 
 **NVIDIA's 120B vision-language model on one DGX Spark: 20% faster than stock TensorFold on a one-request counting
 test, with the same replies.**
 
-This recipe serves Nemotron 3.5 Super VL from NVIDIA's NVFP4 checkpoint with
-[TensorFold](https://github.com/ashhart/TensorFold)'s native CUDA engine plus 18 patches. In every check we ran,
-replies were token for token the same as stock's. You get an OpenAI-compatible API with text and images, up to 8
-requests at once and a 131,072-token window each. The weights are not in this repository: you download them from
+This recipe serves Nemotron 3.5 Super VL from NVIDIA's NVFP4 checkpoint with stock
+[TensorFold](https://github.com/ashhart/TensorFold) 1.1.0's native CUDA engine, which now ships the 16 engine changes
+this recipe used to patch in. In every check we ran, its replies were token for token the same as stock TensorFold
+1.0.12's. You get an OpenAI-compatible API with text and images, up to 8 requests at once and a 131,072-token window
+each. The weights are not in this repository: you download them from
 [Hugging Face](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4).
 
 | I want to... | Use | What you get |
 |---|---|---|
 | Serve the model on my Spark | [Quickstart](#quickstart) ![Ready to try](https://img.shields.io/badge/ready_to_try-0969da?style=flat-square) | API on port 8888, text and images |
 | Check the speed claims | [`tools/bench.py`](tools/bench.py) ![Benchmark tools](https://img.shields.io/badge/benchmark_tools-1a7f37?style=flat-square) | The More measurements table on your machine, with reply hashes |
-| See what changed in the engine | [`patches/`](patches) ![Same tokens as stock](https://img.shields.io/badge/same_tokens_as_stock-1a7f37?style=flat-square) | 18 patches (16 engine changes, 2 docs) against TensorFold `v1.0.12` |
+| See what changed in the engine | [Engine changes](#engine-changes-now-in-tensorfold-110) ![In TensorFold 1.1.0](https://img.shields.io/badge/in_TensorFold_1.1.0-1a7f37?style=flat-square) | 16 changes, merged upstream and shipped in TensorFold 1.1.0 |
 
 ## Stock vs this recipe
 
@@ -110,15 +111,14 @@ both at the recipe's settings. Medians of 3 requests after a warmup, server-repo
 ## Quickstart
 
 You need a DGX Spark with the NVIDIA driver and a systemd user session, the Hugging Face CLI (`hf`), about 70 GiB
-of disk, and about 115 GiB of free memory at start. Building the engine also needs git,
-[Zig 0.17.0](https://ziglang.org/download/) and CUDA 13's `nvcc` on `PATH` (or set `ZIG` and `NVCC`).
+of disk, and about 115 GiB of free memory at start.
 
 ```bash
 git clone https://github.com/plotarmordev/Nemotron-3.5-Super-VL-Single-DGX-Spark-TensorFold.git
 cd Nemotron-3.5-Super-VL-Single-DGX-Spark-TensorFold
 hf download nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4 \
   --revision 82d93699acd3be9e4617c53360fe5b3f5dbeb1b3 --local-dir ~/models/nemotron-3.5-super-vl-nvfp4
-./start.sh        # first run checks the checkpoint and builds the engine (~2 min)
+./start.sh        # first run downloads the engine and checks the checkpoint
 tools/smoke.py    # one text and one image request
 ./stop.sh
 ```
@@ -151,25 +151,26 @@ flags after `./start.sh`. All of them are in [`scripts/config.sh`](scripts/confi
 <details>
 <summary>Memory</summary>
 
-At the default window the engine takes 74.03 GiB for the model and its first request, then 1.39 GiB per extra
-request and a 16 GiB prompt cache; 12.2 GiB (a tenth of RAM) stays reserved. With 8 requests filled to 112k tokens
-each, an earlier build kept at least 21 GiB of memory available. With less than ~115 GiB free at start the engine
-keeps a smaller cache, and below ~99 GiB fewer requests.
+At the default window the engine takes 74.18 GiB for the model and its first request. At start it also sets aside the
+other 7 requests' attention caches (7.9 GiB of pages they lease as they grow, plus 264 MiB each) and 7.8 GiB of its
+16 GiB prompt cache; 12.2 GiB (a tenth of RAM) stays reserved. A started server left about 20 GiB of memory
+available, and with 8 requests filled to 112k tokens each at least 13 GiB. With less free at start the engine keeps a
+smaller cache, then fewer requests; its startup line says what it kept.
 
 </details>
 
 <details>
-<summary>A Spark without GitHub or the build tools</summary>
+<summary>A Spark without GitHub</summary>
 
-Build on any aarch64 Linux machine that has them, then copy the engine over (`spark` is the Spark's SSH host):
+Copy the release archive and its checksum from
+[TensorFold v1.1.0](https://github.com/ashhart/TensorFold/releases/tag/v1.1.0) to the Spark, then point the recipe at
+them:
 
 ```bash
-scripts/prepare.sh --engine-only
-ssh spark mkdir -p opt/tensorfold
-rsync -a ~/opt/tensorfold/tensorfold-1.0.12-* spark:opt/tensorfold/
+TF_ARCHIVE=~/tensorfold-1.1.0-linux-aarch64.tar.gz ./start.sh   # its .sha256 beside it
 ```
 
-On the Spark, `./start.sh` checks the copied engine against its `SHA256SUMS` and uses it as it is.
+`scripts/prepare.sh` checks the archive against its `.sha256` and the pinned `TF_SHA256` before it unpacks it.
 
 </details>
 
@@ -181,7 +182,7 @@ Paste this into Claude Code, Codex, Cursor or whichever agent you use, on the DG
 Help me serve Nemotron 3.5 Super VL with https://github.com/plotarmordev/Nemotron-3.5-Super-VL-Single-DGX-Spark-TensorFold
 Read its README first and use only the repository's own scripts.
 
-1. Check for an NVIDIA GB10, the hf CLI, zig 0.17.0, CUDA 13 nvcc, 70 GiB of disk and ~115 GiB of free memory.
+1. Check for an NVIDIA GB10, the hf CLI, 70 GiB of disk and ~115 GiB of free memory.
    Stop and tell me if anything is missing.
 2. Download the checkpoint at the README's pinned revision, then run ./start.sh. The first run takes a while.
 3. Run tools/smoke.py and show me both replies.
@@ -189,29 +190,23 @@ Read its README first and use only the repository's own scripts.
 Don't stop other GPU work or change settings I didn't ask for.
 ```
 
-## What the patches change
+## Engine changes, now in TensorFold 1.1.0
 
-Every patch keeps TensorFold's exactness contract: drafted replies equal undrafted ones, concurrent requests equal
-solo runs, and resumed prompts equal fresh ones. Each patch's message has its own measurements.
+This recipe used to carry 16 engine changes as patches on TensorFold 1.0.12. They were merged upstream, with the
+maintainer's follow-ups, and ship in TensorFold 1.1.0, so the recipe now runs the stock release. Each keeps
+TensorFold's exactness contract: drafted replies equal undrafted ones, concurrent requests equal solo runs, and
+resumed prompts equal fresh ones.
 
-<details>
-<summary>The 18 patches</summary>
-
-| # | Change | Helps |
-|---|---|---|
-| 1 | Latent top-k: one thread per expert | decode |
-| 2 | NVFP4 experts at decode sizes: 32 columns a warp, loads in flight | decode |
-| 3 | Shared-expert plans built once at load; also fixes `--segments 2` replies | decode |
-| 4 | Shared expert on a side stream beside the routed experts | decode |
-| 5 | Draft head over the embedded 49,152-token draft vocabulary | drafting |
-| 6 | `--mtp-drafts` / `--mtp-confidence` on CUDA | opt-in |
-| 7–9 | Verify windows of up to 32 rows (31 drafts a round) | drafting |
-| 10 | Copied chains start at 15 tokens and grow with what they keep | repeated text |
-| 11 | Each request picks the subset or full draft head from its recent tokens | drafting outside English |
-| 12–16 | Prompt passes: FP8 and NVFP4 tiles, fused quantization and share sums, tiled router | prompts |
-| 17–18 | TensorFold's docs and changelog for the above | docs |
-
-</details>
+- **Decode:** latent top-k with one thread per expert and NVFP4 experts at decode sizes
+  ([#999](https://github.com/ashhart/TensorFold/pull/999)); shared-expert plans built once at load and the shared
+  expert on a side stream beside the routed experts ([#1002](https://github.com/ashhart/TensorFold/pull/1002)), with
+  the `--segments 2` fix ([#996](https://github.com/ashhart/TensorFold/pull/996)).
+- **Drafting:** verify windows of up to 32 rows (31 drafts a round) and copied chains that start at 15 tokens
+  ([#1006](https://github.com/ashhart/TensorFold/pull/1006)); a draft head over the embedded 49,152-token draft
+  vocabulary, chosen per request from its recent tokens ([#1011](https://github.com/ashhart/TensorFold/pull/1011));
+  `--mtp-drafts` / `--mtp-confidence` on CUDA ([#997](https://github.com/ashhart/TensorFold/pull/997)).
+- **Prompts:** FP8 and NVFP4 tiles, fused quantization and share sums, and a tiled router
+  ([#1008](https://github.com/ashhart/TensorFold/pull/1008)).
 
 <details>
 <summary>Known limits</summary>
@@ -219,14 +214,10 @@ solo runs, and resumed prompts equal fresh ones. Each patch's message has its ow
 - **Images:** replies match stock's tokens, but image prompt speed was not optimized and only one image prompt was
   measured.
 - **Two Sparks:** splitting the model over two GB10s is
-  [upstream's setup](https://github.com/ashhart/TensorFold/blob/v1.0.12/docs/recipes/nemotron-3.5-super-vl.md#run-on-two-gb10s),
-  not this recipe; the patches were checked there for identical tokens only.
-- **Tests:** running the shared expert on a side stream has no byte-for-byte test of its own; end-to-end token
-  identity covers it.
-- **Thermal guard:** long prompts can pause while the board cools (36–56 s each on 112k-token prompts); replies
+  [upstream's setup](https://github.com/ashhart/TensorFold/blob/v1.1.0/docs/recipes/nemotron-3.5-super-vl.md#run-on-two-gb10s),
+  not this recipe.
+- **Thermal guard:** long prompts can pause while the board cools (40–74 s each on 112k-token prompts); replies
   are unchanged.
-- **Builds:** the engine's bytes depend on the folder it was built in (one compiler-generated symbol), so compare
-  builds by their replies' `token_sha256`.
 
 </details>
 
@@ -234,8 +225,7 @@ solo runs, and resumed prompts equal fresh ones. Each patch's message has its ow
 
 The recipe is [MIT](LICENSE). Its scripts follow
 [Mia's AI Lab recipe](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold), whose notice
-`LICENSE` keeps. The patches modify TensorFold and are Apache-2.0 ([`patches/LICENSE`](patches/LICENSE),
-[`patches/NOTICE`](patches/NOTICE)). The model is under NVIDIA's [OpenMDW License 1.1](https://openmdw.ai/license/1-1/)
-and is downloaded, never redistributed.
+`LICENSE` keeps. TensorFold (Apache-2.0) and the model, under NVIDIA's
+[OpenMDW License 1.1](https://openmdw.ai/license/1-1/), are downloaded, never redistributed.
 
-[Credits](CREDITS.md) · [Patches](patches) · [Settings](scripts/config.sh) · [Contributing](CONTRIBUTING.md) · [MIT license](LICENSE)
+[Credits](CREDITS.md) · [Settings](scripts/config.sh) · [Contributing](CONTRIBUTING.md) · [MIT license](LICENSE)
