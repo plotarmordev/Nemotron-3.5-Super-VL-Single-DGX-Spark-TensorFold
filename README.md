@@ -33,12 +33,13 @@ TensorFold 1.0.12 ran before and after this recipe on TensorFold 1.1.0, each at 
 |---|---:|---:|---:|
 | 1 at a time, median tok/s (8 runs each) | 77.3 | **96.2** | 75.8 |
 | Change | | **+18.5%** ![Measured faster](https://img.shields.io/badge/measured_faster-1a7f37?style=flat-square) | stock drift −1.9% |
-| 4 at once, median combined tok/s | 127.1 | 168.8 | 149.5 |
+| 4 at once, median combined tok/s | 127.1 | 135 or 203 (median 168.8) | 149.5 |
 | Change | | +11% to +27% ![Too close to call](https://img.shields.io/badge/too_close_to_call-a16207?style=flat-square) | stock drift +14.9% |
 | 8 at once, median combined tok/s | 146.4 | **213.2** | 160.3 |
 | Change | | **+29%** ![Measured faster](https://img.shields.io/badge/measured_faster-1a7f37?style=flat-square) | stock drift +13.8% |
 
-Every measured reply was the same text in both deployments: 24 one at a time, 96 at 4 at once, 192 at 8 at once.
+Every measured reply was the same text in both deployments: 24 one at a time, 96 at 4 at once, 192 at 8 at once
+(and the warm-ups: 8, 32 and 64).
 
 <details>
 <summary>What this number doesn't show</summary>
@@ -47,22 +48,22 @@ Every measured reply was the same text in both deployments: 24 one at a time, 96
   predictable, so speculative decoding (drafting) does most of the work. Quote "+18.5% one at a time and +29% at 8
   on this workload", not a general speedup. At 4 at once no gain is established.
 - **Not covered:** images, long prompts, more than 8 requests at once.
-- **Whole deployments:** stock ran at its defaults (a 16,384-token window), the recipe at its own (131,072 tokens,
-  images on), so this compares deployments, not engines; More measurements compares the engines at the same
+- **Whole deployments:** stock ran at its defaults (a 16,384-token window), the recipe at its own (131,072 tokens),
+  both with images on, so this compares deployments, not engines; More measurements compares the engines at the same
   settings.
 - **Statistics:** one at a time, +18.50% over the first stock run (95% interval +5.53 to +33.06) and +20.84% over
   the second (+7.62 to +35.69). At 4 at once, +27.09% (+2.40 to +57.73) and +10.62% (−7.91 to +32.88), so the
   Grill calls it too close to call. At 8, +46.93% (+37.14 to +57.42) and +29.12% (+20.89 to +37.90); +29% is the
   smaller. Each change is the Grill's estimate over all 8 runs (log scale), not the ratio of the medians shown. The
   intervals are model-based and may be too narrow for runs made one after another.
-- **Heat pauses and spread:** the engines' thermal guard (85/75 °C) paused prompts 27 to 47 times in each run
-  window. One recipe run one at a time counted 65.0 tok/s (the others 95.7 to 96.4). At 4 at once both deployments
-  switched between two levels (stock 110 to 151, the recipe 135 or 203 combined tok/s), and stock moved 14 to 15%
-  between its two runs at 4 and at 8.
+- **Heat pauses and spread:** the engines' thermal guard (85/75 °C) paused prompts in every run window. One recipe
+  run one at a time counted 65.0 tok/s (the others 95.7 to 96.4). At 4 at once the recipe switched between two levels
+  (135 or 203 combined tok/s) and stock's first run spread from 110 to 151.
 - **Startup tuning:** at its first start the engine times its drafting options and saves the result; which table a
   start finds can move counting by a few percent.
-- **Run details:** 8 runs per deployment, all complete: 32 of 32 requests (12,800 tokens) one at a time, 128 of
-  128 (51,200 tokens) at 4 at once and 256 of 256 (102,400 tokens) at 8, for stock, the recipe and stock again.
+- **Run details:** 8 runs per deployment, all complete: 32 of 32 requests (12,800 tokens; 8 of them warm-ups) one at
+  a time, 128 of 128 (51,200 tokens; 32 warm-ups) at 4 at once and 256 of 256 (102,400 tokens; 64 warm-ups) at 8,
+  for stock, the recipe and stock again.
 
 </details>
 

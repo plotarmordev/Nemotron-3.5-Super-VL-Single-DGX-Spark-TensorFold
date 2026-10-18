@@ -20,7 +20,6 @@ MODEL_REPO=nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4
 MODEL_REVISION=82d93699acd3be9e4617c53360fe5b3f5dbeb1b3
 TF_VERSION=1.1.0
 TF_SHA256=8f18033fca9df0c56c19afb2f11b55175151ff886c2603b01c0390bf48773e59   # the release archive
-TF_COMMIT=76aafcf274e60a5e31a59ce145b2f71f7b366e9d                           # the source tag v$TF_VERSION points at
 
 # The checkpoint: a plain folder (e.g. `hf download ... --local-dir`), checked against ./checkpoint.sha256, which
 # lists the sha256 of every file the revision has except its README and pictures.
@@ -31,7 +30,7 @@ TF_HOME="${TF_HOME:-$HOME/opt/tensorfold}"
 TF_ARCHIVE="${TF_ARCHIVE:-}"   # a local copy of the release archive (its .sha256 beside it), for nodes without GitHub
 # The recipe's own TF_* names. Every other TF_* and TENSORFOLD_* variable in the environment is the engine's, and
 # start.sh passes it to the server.
-RECIPE_TF_VARS=(TF_VERSION TF_SHA256 TF_COMMIT TF_HOME TF_ARCHIVE)
+RECIPE_TF_VARS=(TF_VERSION TF_SHA256 TF_HOME TF_ARCHIVE)
 
 SERVED_NAME="${SERVED_NAME:-nemotron-3.5-super-vl}"   # the model id clients see in /v1/models (tensorfold --name)
 HOST="${HOST:-0.0.0.0}"
@@ -45,7 +44,8 @@ THINKING="${THINKING:-1}"              # 1: reason before answering by default; 
 PROMPT_CACHE_GIB="${PROMPT_CACHE_GIB:-}"   # kept prompt states; empty: 16 GiB, less if the streams leave less
 # MTP drafting, with exact verification. DRAFTS=0 serves without it (--no-drafts). MTP_DRAFTS (drafts a round) and
 # MTP_CONFIDENCE (a chain stops before a draft under it) are passed only when set.
-# MTP_DRAFTS=15 MTP_CONFIDENCE=0.5 is the option for count- and repetition-heavy work (README, Settings).
+# MTP_DRAFTS=15 MTP_CONFIDENCE=0.5 suited count- and repetition-heavy work on the patched 1.0.12; not yet measured on
+# 1.1.0 (README, Settings).
 DRAFTS="${DRAFTS:-1}"
 MTP_DRAFTS="${MTP_DRAFTS:-}"
 MTP_CONFIDENCE="${MTP_CONFIDENCE:-}"
@@ -58,7 +58,8 @@ export TF_HEAT_LOW="${TF_HEAT_LOW:-75}"
 UNIT="${UNIT:-nemotron-super-vl}"         # the server's systemd user unit
 STOP_TIMEOUT="${STOP_TIMEOUT:-30}"        # seconds the server gets after SIGTERM before SIGKILL (set at start)
 RUNTIME_MAX="${RUNTIME_MAX:-infinity}"    # wall-clock limit on the server's life (systemd RuntimeMaxSec)
-# Memory available at start for all 8 streams and the full prompt cache; see README, Memory.
+# Memory available at start known to be enough for all 8 streams and the full prompt cache (starts from 116 and 109
+# GiB both kept them); see README, Memory.
 MIN_FREE_GIB="${MIN_FREE_GIB:-115}"
 STATE_DIR="${STATE_DIR:-$HOME/.cache/nemotron-super-vl-spark}"   # locks, what prepare.sh left
 

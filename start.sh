@@ -121,7 +121,7 @@ avail_gib=$(awk '/^MemAvailable:/ { printf "%d", $2 / 1048576 }' /proc/meminfo)
 if (( avail_gib >= MIN_FREE_GIB )); then
   log "Arguments OK, GPU idle, port $PORT free, ${avail_gib} GiB memory available"
 else
-  warn "only ${avail_gib} GiB memory available (all 8 streams and the full prompt cache need ~${MIN_FREE_GIB}): the engine will keep a smaller cache or fewer streams; stop other work, or lower CONTEXT / PARALLEL / PROMPT_CACHE_GIB"
+  warn "only ${avail_gib} GiB memory available (~${MIN_FREE_GIB} is known to be enough for all 8 streams and the full prompt cache): the engine may keep a smaller cache or fewer streams; stop other work, or lower CONTEXT / PARALLEL / PROMPT_CACHE_GIB"
 fi
 
 # The engine's switches from the environment reach the server: TENSORFOLD_* and every TF_* but the recipe's own.
@@ -140,9 +140,11 @@ systemd-run --user --quiet --unit="$UNIT" --description="TensorFold $TF_VERSION:
   "${ENV_ARGS[@]}" "$TF_BIN" serve "$MODEL_DIR" "${SERVE_ARGS[@]}"
 
 # ---------------------------------------------------------------- 4. load, with the server's log and a heartbeat
-# The model and its first stream with and without the image tower, as TensorFold 1.1.0 reports them on a GB10
-# (73.08 / 70.78 GiB). The first start of a new build also times its verify windows (~2 min), cached for later starts.
-step 4 "Loading: ~$( (( images )) && echo 73 || echo 71) GiB onto the GPU (a new build's first start: ~2 min more)"
+# What TensorFold 1.1.0 holds on a GB10 at the default settings (131,072-token window, 8 streams, images), measured:
+# ~92 GiB, the model with its first stream (74.18) plus the other streams' attention pages and the prompt cache's
+# slots, set aside at start. The first start of a new build also times its verify windows (~2 min), cached for later
+# starts.
+step 4 "Loading: ~92 GiB onto the GPU at the default settings (a new build's first start: ~2 min more)"
 # journalctl is the background job, so killing it ends the whole pipeline (no orphaned `journalctl -f`)
 journalctl --user -u "$UNIT" --since "@$launched" -f -o cat > >(sed -u "s/^/  ${D}│${R} /") 2>&1 &
 LOGS_PID=$!
