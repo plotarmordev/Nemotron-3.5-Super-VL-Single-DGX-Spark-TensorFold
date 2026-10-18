@@ -24,30 +24,45 @@ requests at once and a 131,072-token window each. The weights are not in this re
 
 ## Stock vs this recipe
 
-Measured with [the Grill](https://github.com/plotarmordev/thegrill) 0.6.0 on one DGX Spark: one chat request at a
-time, greedy, thinking off, 400 tokens of counting from 1 to 1,000. Stock ran before and after the recipe.
+Measured with [the Grill](https://github.com/plotarmordev/thegrill) on one DGX Spark: greedy, thinking off, 400
+tokens of counting from 1 to 1,000 per request, one request at a time (Grill 0.6.0) and 4 or 8 at once (Grill
+0.8.0, combined tok/s). Stock ran before and after the recipe.
 
 | | Stock TensorFold 1.0.12 | This recipe | Stock again |
 |---|---:|---:|---:|
-| Median tok/s (8 runs each) | 75.43 | **90.96** | 75.83 |
+| 1 at a time, median tok/s (8 runs each) | 75.43 | **90.96** | 75.83 |
 | Change | | **+20.6%** ![Measured faster](https://img.shields.io/badge/measured_faster-1a7f37?style=flat-square) | stock drift +0.5% |
+| 4 at once, median combined tok/s | 150.14 | **196.26** | 149.50 |
+| Change | | **+26.8%** ![Measured faster](https://img.shields.io/badge/measured_faster-1a7f37?style=flat-square) | stock drift −2.5% |
+| 8 at once, median combined tok/s | 177.65 | **239.95** | 168.89 |
+| Change | | **+41.0%** ![Measured faster](https://img.shields.io/badge/measured_faster-1a7f37?style=flat-square) | stock drift −2.6% |
 
-Every reply was the same text in both deployments: the 24 measured and the 8 warm-ups.
+Every measured reply was the same text in both deployments: 24 one at a time (and its 8 warm-ups), 96 at 4 at
+once, 192 at 8 at once.
 
 <details>
 <summary>What this number doesn't show</summary>
 
-- **One workload:** one request at a time on one counting prompt. Counting is very predictable, so speculative
-  decoding (drafting) does most of the work. Quote it as "+20% on this workload", not as a general speedup.
-- **Not covered:** images, long prompts, concurrent requests.
-- **Different settings:** the recipe also serves a 131,072-token window where stock serves 16,384, so the +20%
+- **One workload:** one counting prompt, sent to every request when several run at once. Counting is very
+  predictable, so speculative decoding (drafting) does most of the work. Quote "+20% one at a time, +27% at 4 and
+  +41% at 8 on this workload", not a general speedup.
+- **Not covered:** images, long prompts, more than 8 requests at once.
+- **Different settings:** the recipe also serves a 131,072-token window where stock serves 16,384, so the gains
   can't be credited to the patches alone; More measurements compares both at the same settings.
-- **Statistics:** +20.56% over the first stock run (95% interval +20.43 to +20.69) and +19.99% over the second
-  (+19.87 to +20.10). The intervals are model-based and may be too narrow for runs made one after another.
-- **Startup tuning:** at its first start the engine times its drafting options and saves the result; both runs
-  reused a saved table. Fresh starts of an earlier build counted at 92.2 to 95.9 tok/s (7 starts).
-- **Run details:** 8 runs per deployment, all complete; 32 of 32 requests (12,800 tokens) for stock and for the
-  recipe.
+- **Statistics:** one at a time, +20.56% over the first stock run (95% interval +20.43 to +20.69) and +19.99% over
+  the second (+19.87 to +20.10). At 4 at once, +26.84% (+10.25 to +45.94) and +30.09% (+12.07 to +50.99); at 8,
+  +41.04% (+23.33 to +61.29) and +44.78% (+26.59 to +65.59). Each change is the Grill's estimate over all 8 runs
+  (log scale), not the ratio of the medians shown. The intervals are model-based and may be too narrow for runs
+  made one after another.
+- **Wider spread when several run at once:** at 4 at once the recipe's runs ranged from 142 to 221 combined tok/s
+  (most near 173 or 220), and the engines' thermal guard paused each deployment about 30 times (2 or 4 s each)
+  during these runs. Those intervals are much wider than one at a time; the gains are still above zero against
+  both stock runs.
+- **Startup tuning:** at its first start the engine times its drafting options and saves the result; the one at
+  a time runs reused a saved table. Fresh starts of an earlier build counted at 92.2 to 95.9 tok/s one at a time
+  (7 starts).
+- **Run details:** 8 runs per deployment, all complete: 32 of 32 requests (12,800 tokens) one at a time, 128 of
+  128 (51,200 tokens) at 4 at once and 256 of 256 (102,400 tokens) at 8, for stock, the recipe and stock again.
 
 </details>
 
