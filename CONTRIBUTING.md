@@ -5,8 +5,14 @@ template.
 
 ## Engine changes
 
-Engine changes go upstream to [TensorFold](https://github.com/ashhart/TensorFold), as this recipe's own did; the
-recipe serves its stock release.
+Engine changes go upstream to [TensorFold](https://github.com/ashhart/TensorFold). Until a TensorFold release ships
+one, the recipe may carry it as a patch on the release it pins, listed in
+[`patches/PATCHES.md`](patches/PATCHES.md) with its upstream pull request; the release that ships it replaces the
+patch. [`patches/PATCHES.md`](patches/PATCHES.md#rules) has the rules.
+
+The README promises replies token for token the same as stock TensorFold's. A pull request that changes `patches/`
+keeps that promise: boot `main` and the pull request as in [Baseline](#baseline), run `tools/bench.py decode` on
+each, and paste both outputs into Testing. Every `token_sha256` must be the same on both.
 
 ## Performance claims
 
@@ -14,19 +20,20 @@ Most pull requests need nothing extra. A pull request that **claims a speed impr
 measured against the recipe's baseline, so maintainers can judge the claim without re-testing it.
 
 **What counts as a claim:** saying the change makes the recipe faster (in the title, description, a commit
-message or your own comments), changing a number in the README, or changing a default, an option or the engine
-release because it is faster. No claim, no measurement. If the numbers don't support the claim, drop the claim;
-the pull request can still be opened.
+message or your own comments), changing a number in the README, or changing a default, an option, a patch or the
+engine release because it is faster. No claim, no measurement. If the numbers don't support the claim, drop the
+claim; the pull request can still be opened.
 
 ### Baseline
 
 Every run uses the recipe's defaults on one DGX Spark, so numbers from different contributors compare:
 
-- No `.env`, or one that only says where things are on your Spark: `MODEL_DIR`, `TF_HOME`, and `TF_ARCHIVE` on a
-  Spark without GitHub.
+- No `.env`, or one that only says where things are on your Spark: `MODEL_DIR`, `TF_HOME`, `ZIG`, `NVCC`, and
+  `TF_ARCHIVE` and `TF_SRC` on a Spark without GitHub.
 - A shell with none of the recipe's variables exported (`scripts/config.sh` lists them), and no `TF_*` or
   `TENSORFOLD_*`: exports override `.env` and the defaults, and reach the engine.
-- `./start.sh` with no arguments, from that checkout: it serves the TensorFold release the checkout pins.
+- `./start.sh` with no arguments, from that checkout: it builds the checkout's `patches/` on the TensorFold release
+  it pins.
 - Nothing else running on the GPU.
 
 A claim about other settings (for example `VISION=0`) uses them on every run instead. Say so in the declarations.
@@ -60,8 +67,8 @@ For a new opt-in option, all three runs use your pull request: A and A2 without 
 
 Write one declaration for each side, `a.json` and `b.json`. `runtime` is the checkout's `git rev-parse HEAD`.
 `settings` is `baseline` (the checkout's `scripts/config.sh` defaults), plus the option on B for an option claim,
-plus the settings on both for a claim at other settings. The two files differ only in `runtime` (a code, release or
-default change) or only in `settings` (an option); the Grill refuses B otherwise.
+plus the settings on both for a claim at other settings. The two files differ only in `runtime` (a code, patch,
+release or default change) or only in `settings` (an option); the Grill refuses B otherwise.
 
 ```json
 {"model_revision": "as in scripts/config.sh",
@@ -77,7 +84,7 @@ On the Spark, with `ENDPOINT=http://127.0.0.1:8888/v1/chat/completions`, `MODEL=
 # A
 grill-perf baseline --workload "$WORKLOAD" --client-placement same-host \
   --endpoint "$ENDPOINT" --local-http --model "$MODEL" --deployment a.json --out A
-# B: --change runtime for a code, release or default change, --change settings for an option
+# B: --change runtime for a code, patch, release or default change, --change settings for an option
 grill-perf check A --change runtime --deployment b.json --out B
 # A2 (its own exit code doesn't matter)
 grill-perf check A --change none --deployment A/deployment.json --out A2

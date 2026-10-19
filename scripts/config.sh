@@ -15,22 +15,31 @@ if [[ -f .env ]]; then
   done < .env
 fi
 
-# Pins, not settings: what checkpoint.sha256 is made for, and the engine release. Change them together, here.
+# Pins, not settings: what checkpoint.sha256, the engine release and the patch series are made for. Change them
+# together, here.
 MODEL_REPO=nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4
 MODEL_REVISION=82d93699acd3be9e4617c53360fe5b3f5dbeb1b3
 TF_VERSION=1.1.0
 TF_SHA256=8f18033fca9df0c56c19afb2f11b55175151ff886c2603b01c0390bf48773e59   # the release archive
+TF_COMMIT=76aafcf274e60a5e31a59ce145b2f71f7b366e9d                           # what tag v$TF_VERSION must point at
+ZIG_VERSION=0.17.0
+ZIG_SHA256=9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234ff8   # zig-aarch64-linux-$ZIG_VERSION.tar.xz
 
 # The checkpoint: a plain folder (e.g. `hf download ... --local-dir`), checked against ./checkpoint.sha256, which
 # lists the sha256 of every file the revision has except its README and pictures.
 MODEL_DIR="${MODEL_DIR:-$HOME/models/nemotron-3.5-super-vl-nvfp4}"
 
-# The engine: TensorFold's native release (one binary, no Python or Docker), unpacked into TF_HOME.
+# The engine: TensorFold's native release (one binary, no Python or Docker), unpacked into TF_HOME. With
+# patches/*.patch the same tag is built from source with them, into its own folder beside the release.
+TF_REPO="${TF_REPO:-https://github.com/ashhart/TensorFold.git}"
 TF_HOME="${TF_HOME:-$HOME/opt/tensorfold}"
 TF_ARCHIVE="${TF_ARCHIVE:-}"   # a local copy of the release archive (its .sha256 beside it), for nodes without GitHub
+TF_SRC="${TF_SRC:-}"           # a local TensorFold clone to take tag v$TF_VERSION from instead of TF_REPO
+ZIG="${ZIG:-}"                 # a zig $ZIG_VERSION to build with; empty: the pinned release, fetched into TF_HOME
+NVCC="${NVCC:-$(command -v nvcc || echo /usr/local/cuda/bin/nvcc)}"           # CUDA 13
 # The recipe's own TF_* names. Every other TF_* and TENSORFOLD_* variable in the environment is the engine's, and
 # start.sh passes it to the server.
-RECIPE_TF_VARS=(TF_VERSION TF_SHA256 TF_HOME TF_ARCHIVE)
+RECIPE_TF_VARS=(TF_VERSION TF_SHA256 TF_COMMIT TF_REPO TF_HOME TF_ARCHIVE TF_SRC)
 
 SERVED_NAME="${SERVED_NAME:-nemotron-3.5-super-vl}"   # the model id clients see in /v1/models (tensorfold --name)
 HOST="${HOST:-0.0.0.0}"
@@ -61,7 +70,7 @@ RUNTIME_MAX="${RUNTIME_MAX:-infinity}"    # wall-clock limit on the server's lif
 # Memory available at start known to be enough for all 8 streams and the full prompt cache (starts from 116 and 109
 # GiB both kept them); see README, Memory.
 MIN_FREE_GIB="${MIN_FREE_GIB:-115}"
-STATE_DIR="${STATE_DIR:-$HOME/.cache/nemotron-super-vl-spark}"   # locks, what prepare.sh left
+STATE_DIR="${STATE_DIR:-$HOME/.cache/nemotron-super-vl-spark}"   # locks, the source build, what prepare.sh left
 
 # Colours only on a terminal.
 _c() { if [[ -t "$1" ]]; then printf '\033[%sm' "$2"; fi; }
@@ -69,7 +78,12 @@ log()  { printf '%s[%s]%s %s\n' "$(_c 1 '1;36')" "$(basename "$0")" "$(_c 1 0)" 
 warn() { printf '%s[%s] WARN:%s %s\n' "$(_c 2 '1;33')" "$(basename "$0")" "$(_c 2 0)" "$*" >&2; }
 die()  { printf '%s[%s] ERROR:%s %s\n' "$(_c 2 '1;31')" "$(basename "$0")" "$(_c 2 0)" "$*" >&2; exit 1; }
 
-ENGINE_DIR="$TF_HOME/tensorfold-$TF_VERSION-linux-aarch64"
+# The engine patch series, in the order git am applies it (see patches/PATCHES.md).
+patch_files() { local p; for p in patches/*.patch; do [[ -e "$p" ]] && echo "$p"; done; return 0; }
+patches_hash() { patch_files | xargs -r cat | sha256sum | cut -c1-12; }
+
+STOCK_DIR="$TF_HOME/tensorfold-$TF_VERSION-linux-aarch64"
+if [[ -n "$(patch_files)" ]]; then ENGINE_DIR="$TF_HOME/tensorfold-$TF_VERSION-patched-$(patches_hash)"; else ENGINE_DIR="$STOCK_DIR"; fi
 TF_BIN="$ENGINE_DIR/bin/tensorfold-native"
 
 # Where to reach a server bound to HOST:PORT from this machine: a wildcard bind answers on loopback.
@@ -93,7 +107,7 @@ api() {
 gpu_pids() { nvidia-smi --query-compute-apps=pid --format=csv,noheader | tr -d ' '; }
 
 # What scripts/prepare.sh last left ready (it writes this line to PREPARED_MARKER when it succeeds); start.sh runs
-# prepare.sh again whenever the current line differs: another release, another checkpoint.
+# prepare.sh again whenever the current line differs: another release, new patches, another checkpoint.
 PREPARED_MARKER="$STATE_DIR/prepared"
 prepared_state() {
   local bin=missing model=missing
