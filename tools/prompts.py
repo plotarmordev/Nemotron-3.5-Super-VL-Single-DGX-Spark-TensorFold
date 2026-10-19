@@ -1,7 +1,8 @@
 """The prompts tools/bench.py sends: those the README's Measured table ran, byte for byte.
 
-The field log and the picture are generated from fixed seeds and literals; the PNG uses zlib's stored mode, so no
-zlib version changes its bytes.
+The field log and the picture are generated from fixed seeds and literals. The decode prompt's PNG uses zlib's stored
+mode, so no zlib version changes its bytes; image-ttft's 2048 x 1664 PNGs are compressed, since four stored ones
+exceed the server's 20 MiB request limit. The server decodes the same pixels either way.
 """
 import base64
 import random
@@ -77,8 +78,8 @@ def corpus() -> str:
     return "".join(out)
 
 
-def png(width: int, height: int) -> bytes:
-    """A red square, a blue disc and a green triangle on a pale grey ground."""
+def png(width: int, height: int, level: int = 0) -> bytes:
+    """A red square, a blue disc and a green triangle on a pale grey ground, at zlib compression `level`."""
     rows = []
     for y in range(height):
         row = bytearray([0])  # filter type None
@@ -97,7 +98,7 @@ def png(width: int, height: int) -> bytes:
         return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
 
     header = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
-    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header) + chunk(b"IDAT", zlib.compress(b"".join(rows), 0)) \
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header) + chunk(b"IDAT", zlib.compress(b"".join(rows), level)) \
         + chunk(b"IEND", b"")
 
 

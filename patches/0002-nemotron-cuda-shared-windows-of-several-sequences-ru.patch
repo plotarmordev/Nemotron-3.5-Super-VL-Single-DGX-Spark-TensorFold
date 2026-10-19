@@ -1,0 +1,208 @@
+From 951b6b3b519ced175fd06d47eb54d00e7c8e5a43 Mon Sep 17 00:00:00 2001
+From: plotarmordev <299844489+plotarmordev@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 20:26:20 +0800
+Subject: [PATCH 2/2] nemotron cuda: shared windows of several sequences run
+ the latent shared expert on the side stream again
+
+A shared window is one forward over its streams' rows: every MoE layer reads the engine's shared scratch, the cached
+plan for the window's total rows and one fork and join, as a lone window and the MTP head's batched levels already do.
+Only two ranks keep the shared expert on the main stream. tf-cuda-test shared-fork adds shared windows of 2, 4 and 8
+streams at their narrowest and widest, with the shared rows poisoned and the side stream held back.
+---
+ zig/nemotron_mtp_policy_host.zig           | 16 ++---
+ zig/src/families/nemotron/cuda.zig         |  1 +
+ zig/src/families/nemotron/cuda_forward.zig |  2 +-
+ zig/tests/cuda/main.zig                    |  2 +-
+ zig/tests/cuda/shared_fork.zig             | 74 ++++++++++++++++------
+ 5 files changed, 66 insertions(+), 29 deletions(-)
+
+diff --git a/zig/nemotron_mtp_policy_host.zig b/zig/nemotron_mtp_policy_host.zig
+index 38ea543d..7801dc5e 100644
+--- a/zig/nemotron_mtp_policy_host.zig
++++ b/zig/nemotron_mtp_policy_host.zig
+@@ -202,24 +202,22 @@ test "mtp policy: the inherited policy works through 31 drafts and a resumed sha
+     };
+ }
+ 
+-test "mtp policy: shared latent windows avoid per-layer side events while lone graphs retain overlap" {
++test "mtp policy: shared latent windows keep the side stream on one GPU and two ranks keep one stream" {
+     var f: nemo.Forward = undefined;
+     f.c.latent = 512;
+     f.side = .{ .s = undefined, .fork = undefined, .join = undefined };
+     f.tp = null;
+     f.route = .{};
+     var buffers: nemo.state.Buffers = undefined;
+-    const Seg = @typeInfo(@TypeOf(f.segs)).pointer.child;
+-    var parts: [4]Seg = undefined;
+-    for (&parts, 0..) |*p, i| p.* = .{ .b = &buffers, .row0 = i * 8, .rows = 8, .sampled = false, .slot = @intCast(i), .untaught = i == 2 };
++    var parts: [8]nemo.Seg = undefined;
++    for (&parts, 0..) |*p, i| p.* = .{ .b = &buffers, .row0 = i * 4, .rows = 4, .sampled = false, .slot = @intCast(i), .untaught = i == 2 };
+     const shared = f.routedWindow(&parts);
+-    try std.testing.expect(shared.side == null);
+     try std.testing.expect(shared.untaught);
+-    try std.testing.expectEqual(@as(usize, 4), shared.segs.len);
+-    try std.testing.expectEqual(@as(u32, 4), shared.route.count);
+-    try std.testing.expect(f.routedWindow(parts[0..1]).side != null);
++    try std.testing.expectEqual(@as(usize, 8), shared.segs.len);
++    try std.testing.expectEqual(@as(u32, 8), shared.route.count);
++    for ([_]usize{ 1, 2, 4, 8 }) |n| try std.testing.expect(f.routedWindow(parts[0..n]).side != null);
+     f.tp = @ptrFromInt(4096);
+-    try std.testing.expect(f.routedWindow(parts[0..1]).side == null);
++    for ([_]usize{ 1, 2, 4, 8 }) |n| try std.testing.expect(f.routedWindow(parts[0..n]).side == null);
+     f.tp = null;
+     f.c.latent = 0;
+     try std.testing.expect(f.routedWindow(&parts).side != null);
+diff --git a/zig/src/families/nemotron/cuda.zig b/zig/src/families/nemotron/cuda.zig
+index c221b283..2a8c19a4 100644
+--- a/zig/src/families/nemotron/cuda.zig
++++ b/zig/src/families/nemotron/cuda.zig
+@@ -7,6 +7,7 @@ pub const weights = @import("cuda_weights.zig");
+ pub const kernels = @import("cuda_kernels.zig");
+ pub const state = @import("cuda_state.zig");
+ pub const Forward = @import("cuda_forward.zig").Forward;
++pub const Seg = @import("cuda_forward.zig").Seg;
+ pub const Walk = @import("cuda_forward.zig").Walk;
+ pub const Marks = @import("cuda_forward.zig").Marks;
+ pub const Class = @import("cuda_forward.zig").Class;
+diff --git a/zig/src/families/nemotron/cuda_forward.zig b/zig/src/families/nemotron/cuda_forward.zig
+index 6859cb47..2375e7ac 100644
+--- a/zig/src/families/nemotron/cuda_forward.zig
++++ b/zig/src/families/nemotron/cuda_forward.zig
+@@ -140,7 +140,7 @@ pub const Forward = struct {
+     pub fn routedWindow(f: *const Forward, segs: []const Seg) Forward {
+         var routed = f.*;
+         routed.segs = segs;
+-        if (f.c.latent > 0 and (segs.len > 1 or f.tp != null)) routed.side = null;
++        if (f.c.latent > 0 and f.tp != null) routed.side = null;
+         routed.untaught = for (segs) |s| {
+             if (s.untaught) break true;
+         } else false;
+diff --git a/zig/tests/cuda/main.zig b/zig/tests/cuda/main.zig
+index 6f984ad7..3bf4ded7 100644
+--- a/zig/tests/cuda/main.zig
++++ b/zig/tests/cuda/main.zig
+@@ -134,7 +134,7 @@ const usage =
+     \\  prompt-cuts MODEL IDS_FILE   a prompt keeping states inside chunks and at their ends (background passes too), and resumed from each, equals one uncut pass
+     \\  prompt-segments MODEL IDS_FILE   a prompt run as 2 to 4 staggered segments a call equals one uncut pass, byte for byte
+     \\  cached-plans-tp2 MODEL IDS_FILE   rank-zero cached plans and prompt resumes with the existing expert rank
+-    \\  shared-fork MODEL         the latent MoE's shared expert on the side stream (held back) against one stream, byte for byte
++    \\  shared-fork MODEL         the latent MoE's shared expert on the side stream (held back), lone and in shared windows of 2/4/8 streams, against one stream, byte for byte
+     \\  recapture MODEL           graphs captured again while another sequence is bound: both keep their sampling rules
+     \\  paged MODEL IDS_FILE      a paged sequence against the own one: prompt pass, decode, resumes across page edges
+     \\  grouped-plan <dir>        the shared expert plan against experts.route's bytes (oracle/grouped_plan.py)
+diff --git a/zig/tests/cuda/shared_fork.zig b/zig/tests/cuda/shared_fork.zig
+index ae527657..21bc2018 100644
+--- a/zig/tests/cuda/shared_fork.zig
++++ b/zig/tests/cuda/shared_fork.zig
+@@ -6,19 +6,19 @@ const nemotron = @import("nemotron");
+ const check = @import("check.zig");
+ 
+ const hold_bytes = 256 << 20;
++const shared_streams = [_]usize{ 2, 4, 8 };
+ 
+ /// MODEL in both precisions: every latent MoE layer at 1 to max_rows rows, forked against one stream, byte for byte.
+ pub fn run(gpu: check.Gpu, model: []const u8) !void {
+     for ([_]nemotron.Precision{ .checkpoint, .full }) |p| try layers(gpu, model, p);
+ }
+ 
+-/// Each layer's delta with the side stream held back by copies before its fork, against the one-stream delta.
++/// Each layer, lone at every width and shared by 2, 4 and 8 streams, side stream held back, against one stream.
+ fn layers(gpu: check.Gpu, model: []const u8, precision: nemotron.Precision) !void {
+     const gpa = gpu.gpa;
+     const e = try nemotron.Engine.init(gpa, gpu.io, gpu.ctx, model, null, .{ .context = 4096, .graphs = false, .precision = precision });
+     defer e.deinit();
+     const c = e.c;
+-    const b = &e.b;
+     var plain = e.forward(null);
+     plain.side = null;
+     const forked = e.forward(null);
+@@ -29,7 +29,6 @@ fn layers(gpu: check.Gpu, model: []const u8, precision: nemotron.Precision) !voi
+     if (e.w.mtp) |m| try moes.append(gpa, m.moe);
+     var hold = try cuda.DeviceBuffer.alloc(e.ctx.d, hold_bytes);
+     defer hold.free();
+-    const held: nemotron.kernels.Ops = .{ .k = &e.k, .s = side.s };
+     const most = nemotron.state.windowRows(c);
+     const x = try gpa.alloc(u16, most * c.hidden);
+     defer gpa.free(x);
+@@ -38,24 +37,63 @@ fn layers(gpu: check.Gpu, model: []const u8, precision: nemotron.Precision) !voi
+     const got = try gpa.alloc(u8, want.len);
+     defer gpa.free(got);
+     var prng = std.Random.DefaultPrng.init(0x5eed_f04c);
+-    const rng = prng.random();
++    const t: Trial = .{ .e = e, .plain = &plain, .held = .{ .k = &e.k, .s = side.s }, .hold = hold.ptr, .x = x, .want = want, .got = got, .rng = prng.random() };
++    var segs: [nemotron.engine.max_streams]nemotron.Seg = undefined;
++    var what: [96]u8 = undefined;
+     var cases: usize = 0;
+-    for (moes.items, 0..) |moe, layer| for (1..most + 1) |rows| {
+-        for (x[0 .. rows * c.hidden]) |*v| v.* = @truncate(@as(u32, @bitCast((rng.float(f32) - 0.5) * 4.0)) >> 16);
+-        try e.ops().upload(b.y, std.mem.sliceAsBytes(x[0 .. rows * c.hidden]));
++    for (moes.items, 0..) |moe, layer| {
++        for (1..most + 1) |rows| {
++            try t.same(&forked, moe, rows, try std.fmt.bufPrint(&what, "shared-fork ({t}): layer {d} at {d} rows", .{ precision, layer, rows }));
++            cases += 1;
++        }
++        for (shared_streams) |n| for ([_]usize{ n, most }) |rows| {
++            const window = forked.routedWindow(split(&segs, &e.b, n, rows));
++            if (window.side == null) return error.SharedWindowWithoutSideStream;
++            try t.same(&window, moe, rows, try std.fmt.bufPrint(&what, "shared-fork ({t}): layer {d}, {d} streams of {d} rows", .{ precision, layer, n, rows }));
++            cases += 1;
++        };
++    }
++    check.pass("shared-fork ({t}): {d} (layer, rows) cases, lone and shared, the forked delta byte-equal to the one-stream delta", .{ precision, cases });
++}
++
++/// `rows` rows over `n` streams' segments in turn, as Engine.verifyShared lays a shared window out.
++fn split(segs: []nemotron.Seg, b: *const nemotron.state.Buffers, n: usize, rows: usize) []const nemotron.Seg {
++    var row0: usize = 0;
++    for (segs[0..n], 0..) |*s, k| {
++        const r = rows / n + @intFromBool(k < rows % n);
++        s.* = .{ .b = b, .row0 = row0, .rows = r, .sampled = false };
++        row0 += r;
++    }
++    return segs[0..n];
++}
++
++const Trial = struct {
++    e: *nemotron.Engine,
++    plain: *const nemotron.Forward,
++    held: nemotron.kernels.Ops, // the side stream: copies across `hold` keep it behind the main stream at each fork
++    hold: u64,
++    x: []u16,
++    want: []u8,
++    got: []u8,
++    rng: std.Random,
++
++    /// One layer on random rows: `forked`'s delta byte-equal to the one-stream delta.
++    fn same(t: Trial, forked: *const nemotron.Forward, moe: nemotron.weights.MoE, rows: usize, what: []const u8) !void {
++        const e = t.e;
++        const c = e.c;
++        const b = &e.b;
++        for (t.x[0 .. rows * c.hidden]) |*v| v.* = @truncate(@as(u32, @bitCast((t.rng.float(f32) - 0.5) * 4.0)) >> 16);
++        try e.ops().upload(b.y, std.mem.sliceAsBytes(t.x[0 .. rows * c.hidden]));
+         const len = rows * c.hidden * 2;
+-        try nemotron.latent.run(&plain, moe, rows);
+-        try e.ops().download(want[0..len], b.delta);
++        try nemotron.latent.run(t.plain, moe, rows);
++        try e.ops().download(t.want[0..len], b.delta);
+         // the one-stream pass left the right shared rows behind: a sum that skips the join must read NaN instead
+         const shared_rows = b.ymoe + @as(u64, rows * c.top_k * c.ownShares()) * c.latent * 4;
+         try e.ops().fill32(shared_rows, 0x7fc00000, rows * c.ownShares() * c.hidden);
+-        for (0..8) |_| try held.copy(hold.ptr + hold_bytes / 2, hold.ptr, hold_bytes / 2);
+-        try nemotron.latent.run(&forked, moe, rows);
+-        try e.ops().download(got[0..len], b.delta);
++        for (0..8) |_| try t.held.copy(t.hold + hold_bytes / 2, t.hold, hold_bytes / 2);
++        try nemotron.latent.run(forked, moe, rows);
++        try e.ops().download(t.got[0..len], b.delta);
+         try e.stream.synchronize();
+-        var what: [64]u8 = undefined;
+-        try check.sameBytes(try std.fmt.bufPrint(&what, "shared-fork ({t}): layer {d} at {d} rows", .{ precision, layer, rows }), got[0..len], want[0..len]);
+-        cases += 1;
+-    };
+-    check.pass("shared-fork ({t}): {d} (layer, rows) cases, the forked delta byte-equal to the one-stream delta", .{ precision, cases });
+-}
++        try check.sameBytes(what, t.got[0..len], t.want[0..len]);
++    }
++};
+-- 
+2.43.0
+

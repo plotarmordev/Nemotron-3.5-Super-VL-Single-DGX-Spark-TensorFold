@@ -12,13 +12,21 @@
       cold prompts of 2,048, 8,192 and 16,384 tokens, 32 tokens "draft": false: a warmup and 3 each, the median time
       to first token. Start the server for it with
       VISION=0 ./start.sh restart --context 18432 --parallel 1 --segments 1 --prompt-cache-gib 0
+  tools/bench.py image-ttft
+      cold prompts with 1 and 4 generated 2048 x 1664 PNGs, 32 tokens "draft": false: a warmup and 3 each, the
+      median time to first token; a reply from cached prompt rows stops it (cold means uncached prompt rows, not a
+      cold server). Start the server for it with
+      ./start.sh restart --vision-image-tokens 13312 --vision-max-images 4 --context 18432 --parallel 1 \
+        --prompt-cache-gib 0
 
 Every request is greedy, thinking off and streamed. Before a timed request, a hottest thermal zone above
-TF_HEAT_HIGH (85) is let cool to TF_HEAT_LOW (75), so the server's own thermal guard does not pause it; ttft cools to
-TF_HEAT_LOW before every request. Each wait prints one "cooling" line on stderr. Each result ends with the reply's
-token_sha256: builds that are exact print the same. API_URL, MODEL and TENSORFOLD_API_KEY (from the environment; .env
-is not read) pick the server as for tools/smoke.py. Run it on the server's machine, whose thermal zones it reads.
+TF_HEAT_HIGH (85) is let cool to TF_HEAT_LOW (75), so the server's own thermal guard does not pause it; both TTFT
+modes cool to TF_HEAT_LOW before every request. Each wait prints one "cooling" line on stderr. Each result ends with
+the reply's token_sha256: builds that are exact print the same. API_URL, MODEL and TENSORFOLD_API_KEY (from the
+environment; .env is not read) pick the server as for tools/smoke.py. Run it on the server's machine, whose thermal
+zones it reads.
 """
+import base64
 import functools
 import json
 import os
@@ -201,7 +209,27 @@ def ttft():
               f"cached {sum(r['cached'] for r in runs)}  {runs[0]['sha256']}")
 
 
-MODES = {"decode": decode, "streams": streams, "ttft": ttft}
+def image_ttft():
+    url = "data:image/png;base64," + base64.b64encode(prompts.png(2048, 1664, level=9)).decode()
+    image = {"type": "image_url", "image_url": {"url": url}}
+    for count in (1, 4):
+        content = [image] * count + [{"type": "text", "text": "Describe the shapes and colours in these images."}]
+        body = chat({"messages": [{"role": "user", "content": content}], "max_tokens": 32}, draft=False)
+        runs = []
+        for rep in range(REPS + 1):
+            cool(always=True)
+            result = generate("/v1/chat/completions", body)
+            if result["cached"]:
+                raise RuntimeError("image-ttft needs --prompt-cache-gib 0: the server reused prompt rows")
+            if rep:
+                runs.append(result)
+                print(f"{count} images  run {rep}  TTFT {result['ttft']:.3f} s  token_sha256 {result['sha256']}")
+        stable = len({r["sha256"] for r in runs}) == 1
+        print(f"{count} images  median TTFT {statistics.median(r['ttft'] for r in runs):.3f} s  "
+              f"{'stable' if stable else 'UNSTABLE'}  token_sha256 {runs[0]['sha256']}")
+
+
+MODES = {"decode": decode, "streams": streams, "ttft": ttft, "image-ttft": image_ttft}
 
 if __name__ == "__main__":
     mode, names = (sys.argv[1] if len(sys.argv) > 1 else None), sys.argv[2:]
