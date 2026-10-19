@@ -5,15 +5,16 @@
 [![CUDA 13](https://img.shields.io/badge/CUDA-13-76b900?style=flat-square)](#quickstart)
 [![model: Nemotron 3.5 Super VL NVFP4](https://img.shields.io/badge/model-Nemotron_3.5_Super_VL_NVFP4-8250df?style=flat-square)](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4)
 [![engine: TensorFold 1.1.0 + 2 patches](https://img.shields.io/badge/engine-TensorFold_1.1.0_%2B_2_patches-57606a?style=flat-square)](#carried-patches)
-[![status: +18.5% one at a time, +29% at 8](https://img.shields.io/badge/status-%2B18.5%25_one_at_a_time%2C_%2B29%25_at_8-a16207?style=flat-square)](#stock-vs-this-recipe)
+[![status: +18.5% one at a time, +29% at 8, images −28% to first token](https://img.shields.io/badge/status-%2B18.5%25_one_at_a_time%2C_%2B29%25_at_8%2C_images_%E2%88%9228%25_to_first_token-a16207?style=flat-square)](#stock-vs-this-recipe)
 
 **NVIDIA's 120B vision-language model on one DGX Spark: 18.5% faster than stock TensorFold 1.0.12 one request at a
-time and 29% faster with 8 at once on a counting test, with the same replies.**
+time and 29% faster with 8 at once on a counting test, and an image prompt's first word 28% sooner than on stock
+TensorFold 1.1.0, with the same replies.**
 
 This recipe serves Nemotron 3.5 Super VL from NVIDIA's NVFP4 checkpoint with
 [TensorFold](https://github.com/ashhart/TensorFold) 1.1.0's native CUDA engine, which now ships the 16 engine changes
 this recipe used to patch in, plus [2 patches](#carried-patches) it carries until a TensorFold release ships them.
-In every check we ran, its replies were token for token the same as stock TensorFold 1.0.12's. You get an
+In every check we ran, its replies were token for token the same as stock TensorFold 1.0.12's and 1.1.0's. You get an
 OpenAI-compatible API with text and images, up to 8 requests at once and a 131,072-token window each. The weights
 are not in this repository: you download them from
 [Hugging Face](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4).
@@ -51,9 +52,9 @@ Every measured reply was the same text in both deployments: 24 one at a time, 96
 - **Identical requests flatter the concurrent rows:** identical prompts sent together usually decode in step, and each
   shared round then reads about one request's experts. When one request gets a round ahead they no longer do, and the
   wave runs about 20% slower. Most of the Grill's waves, on both sides, ran in step. Prompts that differ (tested with a
-  different first word per request) lose that bonus; More measurements sends a different prompt per request (+14% at
+  different first word per request) lose that bonus; More measurements sends a different prompt per request (+15% at
   4 at once, +30% at 8).
-- **Not covered:** images, long prompts, more than 8 requests at once.
+- **Not covered:** images and long prompts (More measurements times their first token), more than 8 requests at once.
 - **Whole deployments:** stock ran at its defaults (a 16,384-token window), the recipe at its own (131,072 tokens),
   both with images on, so this compares deployments, not engines; More measurements compares the engines at the same
   settings.
@@ -77,40 +78,54 @@ Every measured reply was the same text in both deployments: 24 one at a time, 96
 <details>
 <summary>More measurements</summary>
 
-Stock TensorFold 1.0.12 against this recipe on TensorFold 1.1.0, both release binaries, on one DGX Spark, both at the
-recipe's settings. Two runs of each, alternated, each from a cool, idle box; the mean of their medians of 3 requests
-after a warmup, server-reported decode tok/s, 256-token replies (400 for counting). Every reply's token hash equals
-stock's.
+Stock TensorFold 1.0.12's release binary against this recipe's build (TensorFold 1.1.0 with its 2 patches), on one
+DGX Spark, both at the recipe's settings. Two runs of each, alternated (stock, recipe, stock, recipe), each from a
+cool, idle box; a run is three parts (decode, requests at once, first token), each on a fresh server that times its
+own drafting options. The mean of the two runs' medians of 3 requests after a warmup, server-reported decode tok/s,
+256-token replies (400 for counting). All 532 replies in these runs and the image runs below have the same token
+hash as stock's.
 
-| Measure | Stock | Recipe | Change |
+| Measure | Stock 1.0.12 | This recipe | Change |
 |---|---:|---:|---:|
-| Counting, drafted | 75.14 | 97.12 | +29% |
-| Short story, drafted | 28.99 | 34.11 | +18% |
-| Python code, drafted | 42.79 | 51.91 | +21% |
-| Describing an image, drafted | 59.41 | 70.04 | +18% |
-| English essay, drafted | 29.21 | 34.64 | +19% |
-| Spanish essay, drafted | 31.18 | 35.34 | +13% |
-| French essay, drafted | 28.81 | 32.89 | +14% |
-| German essay, drafted | 29.02 | 32.84 | +13% |
-| Italian essay, drafted | 32.55 | 36.34 | +12% |
-| Japanese essay, drafted | 38.03 | 43.39 | +14% |
-| Counting, `"draft": false` | 18.31 | 21.14 | +15% |
-| 1 request, total tok/s | 42.77 | 51.90 | +21% |
-| 2 requests at once, total tok/s | 42.15 | 46.85 | +11% |
-| 4 requests at once, total tok/s | 56.53 | 64.48 | +14% |
-| 8 requests at once, total tok/s | 68.36 | 89.19 | +30% |
-| First token, 2,048-token prompt | 1.21 s | 0.90 s | −26% |
-| First token, 8,192-token prompt | 4.42 s | 3.06 s | −31% |
-| First token, 16,384-token prompt | 13.22 s | 8.95 s | −32% |
+| Counting, drafted | 77.83 | 99.40 | +28% |
+| Short story, drafted | 30.02 | 35.23 | +17% |
+| Python code, drafted | 44.84 | 53.91 | +20% |
+| Describing an image, drafted | 61.38 | 71.97 | +17% |
+| English essay, drafted | 30.29 | 35.70 | +18% |
+| Spanish essay, drafted | 32.38 | 35.87 | +11% |
+| French essay, drafted | 29.84 | 33.39 | +12% |
+| German essay, drafted | 30.06 | 33.42 | +11% |
+| Italian essay, drafted | 33.73 | 37.48 | +11% |
+| Japanese essay, drafted | 39.41 | 44.67 | +13% |
+| Counting, `"draft": false` | 18.98 | 22.00 | +16% |
+| 1 request, total tok/s | 43.46 | 53.53 | +23% |
+| 2 requests at once, total tok/s | 42.86 | 48.21 | +12% |
+| 4 requests at once, total tok/s | 58.05 | 66.48 | +15% |
+| 8 requests at once, total tok/s | 69.77 | 90.81 | +30% |
+| First token, 2,048-token prompt | 1.20 s | 0.90 s | −25% |
+| First token, 8,192-token prompt | 4.40 s | 3.07 s | −30% |
+| First token, 16,384-token prompt | 12.20 s | 8.99 s | −26% |
+
+First token with images, in seconds, against both stock releases: 1.1.0 is the one patch 0001 fixes (it runs the
+image tower twice per image), 1.0.12 the one the table above compares against. Two runs of each build, alternated.
+
+| Measure | Stock 1.0.12 | Stock 1.1.0 | This recipe | Change vs 1.1.0 | Change vs 1.0.12 |
+|---|---:|---:|---:|---:|---:|
+| First token, 1 image | 2.76 | 3.17 | 2.28 | −28% | −18% |
+| First token, 4 images | 16.43 | 18.68 | 14.98 | −20% | −9% |
+| First token, 4 images, less heat waits | 8.43 | 10.63 | 6.98 | −34% | −17% |
 
 - **Drafting off:** every drafted prompt above, and a multilingual one, was also sent with `"draft": false` and gave
   the same hash. Concurrent requests equalled their solo runs.
 - **Heat pauses:** decode tok/s counts from the first token, so the thermal guard's pauses on prompts don't touch
-  it; a run whose pause fell in a timed concurrent run or a 2k or 8k prompt was measured again.
+  it. A pause in a timed concurrent run or a 2k or 8k prompt would have sent the run back; none fell there.
 - **First token:** cold prompts on a server with `--context 18432 --prompt-cache-gib 0`, the host cooled to 75 °C
-  before each. The guard still paused almost every 16k prompt (stock 4 to 6 s, the recipe 0 to 4 s), and that row
-  includes the pauses. Less the pauses the guard logged: 7.22 s against 4.95 s (−31%); the recipe's one 16k prompt
-  without a pause took 6.29 s.
+  before each. The guard paused every 16k prompt (stock 4 to 6 s, the recipe 4 s), and that row includes the
+  pauses. Less the pauses the guard logged: 7.20 s against 4.99 s (−31%).
+- **Images:** 2048 x 1664 PNGs, 1 or 4 in one message, 32 tokens without drafting, the host cooled to 75 °C before
+  each request. No 1-image request paused, but every 4-image request, on every build, waited 8 s for the board to
+  cool (one stock 1.1.0 request 12 s); the last row takes out the waits the guard logged. All three builds gave the
+  same replies.
 - **Reproduce:** `tools/bench.py decode` (add a prompt name, e.g. `decode count`, for one prompt), `streams`, and
   `ttft` on a server restarted with
   `VISION=0 ./start.sh restart --context 18432 --parallel 1 --segments 1 --prompt-cache-gib 0`. The first token
@@ -239,8 +254,8 @@ equal fresh ones.
 <details>
 <summary>Known limits</summary>
 
-- **Images:** replies match stock's tokens, but image prompt speed was not optimized and only one image prompt was
-  measured.
+- **Images:** replies match stock's tokens. Image speed was measured on one image prompt (decode) and one picture
+  size (first token with 1 and 4 images), and every 4-image prompt paused about 8 s for heat.
 - **Two Sparks:** splitting the model over two GB10s is
   [upstream's setup](https://github.com/ashhart/TensorFold/blob/v1.1.0/docs/recipes/nemotron-3.5-super-vl.md#run-on-two-gb10s),
   not this recipe.
