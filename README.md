@@ -47,10 +47,11 @@ Every measured reply was the same text in both deployments: 24 one at a time, 96
 - **One workload:** one counting prompt, sent to every request when several run at once. Counting is very
   predictable, so speculative decoding (drafting) does most of the work. Quote "+18.5% one at a time and +29% at 8
   on this workload", not a general speedup. At 4 at once no gain is established.
-- **Identical requests flatter the concurrent rows:** requests with the same prompt that start together run in step,
-  so each shared round reads one request's experts. If one request gets a round ahead, the same rounds read more and
-  cost about 20% more. Requests with different prompts never get this; More measurements sends a different prompt per
-  request (+14% at 4 at once, +30% at 8).
+- **Identical requests flatter the concurrent rows:** identical prompts sent together usually decode in step, and each
+  shared round then reads about one request's experts. When one request gets a round ahead they no longer do, and the
+  wave runs about 20% slower. Most of the Grill's waves, on both sides, ran in step. Prompts that differ (tested with a
+  different first word per request) lose that bonus; More measurements sends a different prompt per request (+14% at
+  4 at once, +30% at 8).
 - **Not covered:** images, long prompts, more than 8 requests at once.
 - **Whole deployments:** stock ran at its defaults (a 16,384-token window), the recipe at its own (131,072 tokens),
   both with images on, so this compares deployments, not engines; More measurements compares the engines at the same
@@ -62,7 +63,8 @@ Every measured reply was the same text in both deployments: 24 one at a time, 96
   intervals are model-based and may be too narrow for runs made one after another.
 - **Heat pauses and spread:** the engines' thermal guard (85/75 °C) paused prompts in every run window. One recipe
   run one at a time counted 65.0 tok/s (the others 95.7 to 96.4). At 4 at once the recipe switched between two levels
-  (135 or 203 combined tok/s, out of step or in step) and stock's first run spread from 110 to 151.
+  (203, or 135 when the first token came 4 s late; 4 of 24 waves ran out of step, at 102 to 117) and stock's first
+  run spread from 110 to 151.
 - **Startup tuning:** at its first start the engine times its drafting options and saves the result; which table a
   start finds can move counting by a few percent.
 - **Run details:** 8 runs per deployment, all complete: 32 of 32 requests (12,800 tokens; 8 of them warm-ups) one at
