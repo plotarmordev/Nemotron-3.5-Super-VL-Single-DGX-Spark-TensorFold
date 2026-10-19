@@ -63,7 +63,7 @@ Every measured reply was the same text in both deployments: 24 one at a time, 96
   intervals are model-based and may be too narrow for runs made one after another.
 - **Heat pauses and spread:** the engines' thermal guard (85/75 °C) paused prompts in every run window. One recipe
   run one at a time counted 65.0 tok/s (the others 95.7 to 96.4). At 4 at once the recipe switched between two levels
-  (203, or 135 when the first token came 4 s late; 4 of 24 waves ran out of step, at 102 to 117) and stock's first
+  (203, or 135 when the first token came 4 s late; 4 of its 24 measured rounds of requests ran out of step, at 102 to 117) and stock's first
   run spread from 110 to 151.
 - **Startup tuning:** at its first start the engine times its drafting options and saves the result; which table a
   start finds can move counting by a few percent.
