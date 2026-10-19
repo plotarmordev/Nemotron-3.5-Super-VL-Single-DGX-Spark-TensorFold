@@ -13,15 +13,18 @@
       to first token. Start the server for it with
       VISION=0 ./start.sh restart --context 18432 --parallel 1 --segments 1 --prompt-cache-gib 0
   tools/bench.py image-ttft
-      cold prompts with 1 and 4 generated 2048 x 1664 PNGs, 32 tokens "draft": false: a warmup and 3 each.
-      Start with --vision --vision-image-tokens 13312 --vision-max-images 4 --context 18432 --parallel 1
-      --prompt-cache-gib 0; cached rows are refused. Cold means uncached prompt rows, not a cold server.
+      cold prompts with 1 and 4 generated 2048 x 1664 PNGs, 32 tokens "draft": false: a warmup and 3 each, the
+      median time to first token; a reply from cached prompt rows stops it (cold means uncached prompt rows, not a
+      cold server). Start the server for it with
+      ./start.sh restart --vision-image-tokens 13312 --vision-max-images 4 --context 18432 --parallel 1 \
+        --prompt-cache-gib 0
 
 Every request is greedy, thinking off and streamed. Before a timed request, a hottest thermal zone above
-TF_HEAT_HIGH (85) is let cool to TF_HEAT_LOW (75), so the server's own thermal guard does not pause it; both TTFT modes
-cool to TF_HEAT_LOW before every request. Each wait prints one "cooling" line on stderr. Each result ends with the reply's
-token_sha256: builds that are exact print the same. API_URL, MODEL and TENSORFOLD_API_KEY (from the environment; .env
-is not read) pick the server as for tools/smoke.py. Run it on the server's machine, whose thermal zones it reads.
+TF_HEAT_HIGH (85) is let cool to TF_HEAT_LOW (75), so the server's own thermal guard does not pause it; both TTFT
+modes cool to TF_HEAT_LOW before every request. Each wait prints one "cooling" line on stderr. Each result ends with
+the reply's token_sha256: builds that are exact print the same. API_URL, MODEL and TENSORFOLD_API_KEY (from the
+environment; .env is not read) pick the server as for tools/smoke.py. Run it on the server's machine, whose thermal
+zones it reads.
 """
 import base64
 import functools
@@ -220,8 +223,7 @@ def image_ttft():
                 raise RuntimeError("image-ttft needs --prompt-cache-gib 0: the server reused prompt rows")
             if rep:
                 runs.append(result)
-                print(f"{count} images  run {rep}  TTFT {result['ttft']:.3f} s  "
-                      f"cached {result['cached']}  token_sha256 {result['sha256']}")
+                print(f"{count} images  run {rep}  TTFT {result['ttft']:.3f} s  token_sha256 {result['sha256']}")
         stable = len({r["sha256"] for r in runs}) == 1
         print(f"{count} images  median TTFT {statistics.median(r['ttft'] for r in runs):.3f} s  "
               f"{'stable' if stable else 'UNSTABLE'}  token_sha256 {runs[0]['sha256']}")

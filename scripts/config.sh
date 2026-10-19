@@ -35,7 +35,7 @@ TF_REPO="${TF_REPO:-https://github.com/ashhart/TensorFold.git}"
 TF_HOME="${TF_HOME:-$HOME/opt/tensorfold}"
 TF_ARCHIVE="${TF_ARCHIVE:-}"   # a local copy of the release archive (its .sha256 beside it), for nodes without GitHub
 TF_SRC="${TF_SRC:-}"           # a local TensorFold clone to take tag v$TF_VERSION from instead of TF_REPO
-ZIG="${ZIG:-}"                 # a zig $ZIG_VERSION to build with; empty: the pinned release, fetched into TF_HOME
+ZIG="${ZIG:-}"                 # zig $ZIG_VERSION, a name on PATH or a path; empty: the pinned release, into TF_HOME
 NVCC="${NVCC:-$(command -v nvcc || echo /usr/local/cuda/bin/nvcc)}"           # CUDA 13
 # The recipe's own TF_* names. Every other TF_* and TENSORFOLD_* variable in the environment is the engine's, and
 # start.sh passes it to the server.
@@ -83,7 +83,8 @@ patch_files() { local p; for p in patches/*.patch; do [[ -e "$p" ]] && echo "$p"
 patches_hash() { patch_files | xargs -r cat | sha256sum | cut -c1-12; }
 
 STOCK_DIR="$TF_HOME/tensorfold-$TF_VERSION-linux-aarch64"
-if [[ -n "$(patch_files)" ]]; then ENGINE_DIR="$TF_HOME/tensorfold-$TF_VERSION-patched-$(patches_hash)"; else ENGINE_DIR="$STOCK_DIR"; fi
+ENGINE_DIR=$STOCK_DIR
+[[ -z "$(patch_files)" ]] || ENGINE_DIR="$TF_HOME/tensorfold-$TF_VERSION-patched-$(patches_hash)"
 TF_BIN="$ENGINE_DIR/bin/tensorfold-native"
 
 # Where to reach a server bound to HOST:PORT from this machine: a wildcard bind answers on loopback.

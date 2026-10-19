@@ -64,7 +64,7 @@ else
       cp -- "$TF_ARCHIVE" "$TF_HOME/$ARCHIVE"
       cp -- "$TF_ARCHIVE.sha256" "$TF_HOME/$ARCHIVE.sha256"
     else
-      url="${TF_REPO%.git}/releases/download/v$TF_VERSION/$ARCHIVE"
+      url="https://github.com/ashhart/TensorFold/releases/download/v$TF_VERSION/$ARCHIVE"
       log "Downloading $url"
       { curl -fL --retry 3 -o "$TF_HOME/$ARCHIVE.sha256" "$url.sha256" &&
           curl -fL --retry 3 -o "$TF_HOME/$ARCHIVE" "$url"; } || {
@@ -111,7 +111,9 @@ else
       mv -- "$unpack/$zig_name" "${ZIG%/zig}"
     fi
   fi
-  [[ -x "$ZIG" ]] || die "ZIG=$ZIG is not an executable"
+  # a name on PATH or a path, made absolute because the build runs in the source folder
+  zig=$(command -v -- "$ZIG") || die "ZIG=$ZIG is not an executable zig on PATH or a path to one"
+  ZIG=$(readlink -f -- "$zig")
   [[ -x "$NVCC" ]] || die "nvcc not found at $NVCC: put CUDA 13's nvcc on PATH or set NVCC"
   zig_version=$("$ZIG" version)
   nvcc_version=$("$NVCC" --version | sed -n 's/.*release \([0-9.]*\),.*/\1/p')

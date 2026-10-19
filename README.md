@@ -5,11 +5,11 @@
 [![CUDA 13](https://img.shields.io/badge/CUDA-13-76b900?style=flat-square)](#quickstart)
 [![model: Nemotron 3.5 Super VL NVFP4](https://img.shields.io/badge/model-Nemotron_3.5_Super_VL_NVFP4-8250df?style=flat-square)](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4)
 [![engine: TensorFold 1.1.0 + 2 patches](https://img.shields.io/badge/engine-TensorFold_1.1.0_%2B_2_patches-57606a?style=flat-square)](#carried-patches)
-[![status: +28% one at a time, +22% at 4, +53% at 8, images 28% sooner](https://img.shields.io/badge/status-%2B28%25_one_at_a_time%2C_%2B22%25_at_4%2C_%2B53%25_at_8%2C_images_28%25_sooner-a16207?style=flat-square)](#stock-vs-this-recipe)
+[![status: vs 1.0.12 +28% one at a time, +22% at 4, +53% at 8; images 20–28% sooner than 1.1.0](https://img.shields.io/badge/status-vs_1.0.12_%2B28%25_one_at_a_time%2C_%2B22%25_at_4%2C_%2B53%25_at_8%3B_images_20%E2%80%9328%25_sooner_than_1.1.0-a16207?style=flat-square)](#stock-vs-this-recipe)
 
-**NVIDIA's 120B vision-language model on one DGX Spark: 28% faster than stock TensorFold 1.0.12 one request at a
-time, 22% with 4 at once and 53% with 8 on a counting test, and an image prompt's first word 28% sooner than on
-stock TensorFold 1.1.0, with the same replies.**
+**NVIDIA's 120B vision-language model on one DGX Spark: on a counting test, 28% faster than stock TensorFold 1.0.12
+one request at a time, 22% with 4 identical requests at once and 53% with 8; an image prompt's first token 20–28%
+sooner than on stock TensorFold 1.1.0 (1 to 4 images). The replies are the same.**
 
 This recipe serves Nemotron 3.5 Super VL from NVIDIA's NVFP4 checkpoint with
 [TensorFold](https://github.com/ashhart/TensorFold) 1.1.0's native CUDA engine, which now ships the 16 engine changes
@@ -28,9 +28,13 @@ are not in this repository: you download them from
 ## Stock vs this recipe
 
 Measured with [the Grill](https://github.com/plotarmordev/thegrill) 0.9.0 on one DGX Spark, a different one from
-this table's earlier numbers and from More measurements below: greedy, thinking off, 400 tokens of counting from 1
-to 1,000 per request, one request at a time and 4 or 8 at once (combined tok/s). Stock TensorFold 1.0.12 ran before
-and after this recipe, each at its own defaults.
+More measurements below: greedy, thinking off, 400 tokens of counting from 1 to 1,000 per request, one request at a
+time and 4 or 8 identical requests at once (combined tok/s). Stock TensorFold 1.0.12 ran before and after this
+recipe, each at its own defaults.
+
+This recipe is TensorFold 1.1.0 with its [2 patches](#carried-patches), and the patches don't touch one request's
+text: 0002 changes only windows shared by several requests, 0001 only images. So the gain one at a time is
+TensorFold 1.1.0's own. No run here separates the patches' share at 4 and 8 at once from 1.1.0's.
 
 | | Stock TensorFold 1.0.12 | This recipe | Stock again |
 |---|---:|---:|---:|
@@ -64,13 +68,14 @@ the warm-ups (8, 32 and 64).
   the Grill's estimate over all 8 runs (log scale), not the ratio of the medians shown. The intervals are
   model-based and may be too narrow for runs made one after another.
 - **Stock drift:** stock's second run was 3.4% faster one at a time, 15.5% slower at 4 at once and 10.7% slower at 8
-  (at 8 the Grill finds no clear shift). At 4 at once the thermal guard paused its prompts 22 times, against 3 in
-  its first run: that explains the drift and inflates the +44% over it, so the quoted +22% is over the first run.
+  (at 8 the Grill finds no clear shift). At 4 at once the thermal guard paused its prompts about 22 times, against
+  about 3 in its first run, which lines up with the drift and inflates the +44% over it; the quoted +22% is over the
+  first run.
 - **Heat pauses and spread:** the engines' thermal guard (85/75 °C) paused prompts for 2 s each: 14 times in stock's
-  first run (3 at 4 at once, 11 at 8), 39 in the recipe's (8 and 31) and 50 in stock's second (22 and 28), never one
-  at a time. At 4 at once the recipe ran at two levels, 203 combined tok/s in 3 of its 8 runs and 162 to 165 in 5.
-  At 8 it ran at 247.5 to 247.7 in 7 runs and 211 in one; stock moved between about 138, 157 and 175 in its first
-  run, and 127 and 157 in its second.
+  first run (about 3 at 4 at once and 11 at 8), 39 in the recipe's (about 8 and 31) and 50 in stock's second (about
+  22 and 28), never one at a time. At 4 at once the recipe ran at two levels, 203 combined tok/s in 3 of its 8 runs
+  and 162 to 165 in 5. At 8 it ran at 247.5 to 247.7 in 7 runs and 211 in one; stock moved between about 138, 157
+  and 175 in its first run, and 127 and 157 in its second.
 - **Startup tuning:** at its first start the engine times its drafting options and saves the result; which table a
   start finds can move counting by a few percent.
 - **Run details:** 8 runs per deployment, all complete: 32 of 32 requests (12,800 tokens; 8 of them warm-ups) one at
@@ -149,10 +154,12 @@ git clone https://github.com/plotarmordev/Nemotron-3.5-Super-VL-Single-DGX-Spark
 cd Nemotron-3.5-Super-VL-Single-DGX-Spark-TensorFold
 hf download nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4 \
   --revision 82d93699acd3be9e4617c53360fe5b3f5dbeb1b3 --local-dir ~/models/nemotron-3.5-super-vl-nvfp4
-./start.sh        # first run downloads and builds the engine (~6 min) and checks the checkpoint
+./start.sh        # first run downloads and builds the engine and checks the checkpoint
 tools/smoke.py    # one text and one image request
 ./stop.sh
 ```
+
+The build takes about 6 minutes on an idle Spark, longer on a busy one.
 
 The API is at `http://<spark>:8888/v1` with model `nemotron-3.5-super-vl`. Logs:
 `journalctl --user -u nemotron-super-vl -f`. The server listens on all interfaces: set `TENSORFOLD_API_KEY` to
@@ -202,9 +209,10 @@ rsync -a ~/opt/tensorfold/tensorfold-1.1.0-* spark:opt/tensorfold/
 ```
 
 On the Spark, `./start.sh` checks the copied engine against its `SHA256SUMS` and uses it as it is. To build on the
-Spark itself without GitHub, copy the release archive and its `.sha256` from
-[TensorFold v1.1.0](https://github.com/ashhart/TensorFold/releases/tag/v1.1.0) and a TensorFold clone there, and set
-`TF_ARCHIVE` and `TF_SRC`; `scripts/prepare.sh` checks them against the pinned `TF_SHA256` and `TF_COMMIT`.
+Spark itself without internet access, copy over the release archive and its `.sha256` from
+[TensorFold v1.1.0](https://github.com/ashhart/TensorFold/releases/tag/v1.1.0), a TensorFold clone and
+[Zig 0.17.0](https://ziglang.org/download/), and set `TF_ARCHIVE`, `TF_SRC` and `ZIG`; `scripts/prepare.sh` checks
+them against the pinned `TF_SHA256`, `TF_COMMIT` and `ZIG_VERSION`.
 
 </details>
 

@@ -24,9 +24,7 @@ This repository is scripts and patches. Almost everything that makes it work was
 - **[TensorFold](https://github.com/ashhart/TensorFold)** by Ash Hart ([ashhart](https://github.com/ashhart)) and
   the TensorFold contributors (Apache License 2.0 from v0.6.0; earlier code keeps its MIT notice): the native CUDA
   engine for Nemotron 3.5 Super VL, including the NVFP4 and FP8 kernels, the latent MoE, MTP drafting with exact
-  verification, the RADIO image path, the thermal guard and the OpenAI-compatible server. Every `.patch` file in
-  `patches/` modifies TensorFold v1.1.0; `patches/LICENSE`, `patches/NOTICE` and `patches/LICENSES/MIT.txt` are
-  copied from v1.1.0 (the NOTICE with one line naming the changes).
+  verification, the RADIO image path, the thermal guard and the OpenAI-compatible server.
 - The release archive carries TensorFold's own third-party notices (`THIRD_PARTY_NOTICES.md` and `LICENSES/`), among
   them [xgrammar](https://github.com/mlc-ai/xgrammar) (Apache 2.0) with dlpack (Apache 2.0) and picojson (BSD-2-Clause)
   in `lib/libtfgrammar.so`.
