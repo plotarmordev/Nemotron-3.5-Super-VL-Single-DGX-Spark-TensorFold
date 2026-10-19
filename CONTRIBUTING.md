@@ -52,8 +52,8 @@ shows, checksum included. State the concurrency level in the claim before you me
 for all three runs.
 
 Claims the Grill doesn't measure (cold prefill, prose, images) use [`tools/bench.py`](tools/bench.py) instead, on
-`main` and on the pull request booted the same way (`ttft` with the server settings its usage names). Paste both
-raw outputs into the Performance claim section in a fenced code block.
+`main` and on the pull request booted the same way (`ttft` and `image-ttft` with the server settings their usage
+names). Paste both raw outputs into the Performance claim section in a fenced code block.
 
 Take three runs. Before each one: `./stop.sh`, check out the commit, `./start.sh`.
 

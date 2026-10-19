@@ -207,7 +207,7 @@ def ttft():
 
 
 def image_ttft():
-    url = "data:image/png;base64," + base64.b64encode(prompts.png(2048, 1664)).decode()
+    url = "data:image/png;base64," + base64.b64encode(prompts.png(2048, 1664, level=9)).decode()
     image = {"type": "image_url", "image_url": {"url": url}}
     for count in (1, 4):
         content = [image] * count + [{"type": "text", "text": "Describe the shapes and colours in these images."}]

@@ -113,7 +113,9 @@ stock's.
   without a pause took 6.29 s.
 - **Reproduce:** `tools/bench.py decode` (add a prompt name, e.g. `decode count`, for one prompt), `streams`, and
   `ttft` on a server restarted with
-  `VISION=0 ./start.sh restart --context 18432 --parallel 1 --segments 1 --prompt-cache-gib 0`.
+  `VISION=0 ./start.sh restart --context 18432 --parallel 1 --segments 1 --prompt-cache-gib 0`. The first token
+  with 1 and 4 images: `image-ttft` on a server restarted with
+  `./start.sh restart --vision-image-tokens 13312 --vision-max-images 4 --context 18432 --parallel 1 --prompt-cache-gib 0`.
 
 </details>
 
