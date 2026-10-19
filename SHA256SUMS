@@ -1,6 +1,9 @@
 1098176437efb1c8ceaeb99b3c3a8a17c4f9314067fe0744774de90e3ee7d81d  tensorfold-1.1.0-cutover-pr/grill-evidence-c4.tgz
 5e43ac0de0c8ad03746173e9e1ee347bf98d359c051f999e61ddb48fff167ae5  tensorfold-1.1.0-cutover-pr/grill-evidence-c8.tgz
 b7f8ce3da7fb5c502e7f29f8c74807b30494fac700db3fbe3740a23068c7efe4  tensorfold-1.1.0-cutover-pr/grill-evidence-v1.tgz
+1a712d19f5ad806b80393c82bcfb994a0f898a5056fad30885f031b24c55613f  tensorfold-1.1.0-patched-image-overlap/grill-evidence-c4.tgz
+0cf5411a57dd3c536c5096f41af1e4e2b13f668b20572a0eeec1eb00af0cafcf  tensorfold-1.1.0-patched-image-overlap/grill-evidence-c8.tgz
+af488d778e26c965bf0863bf232ed2266b96b4cd5fcc6cb94a858e6c7e4db665  tensorfold-1.1.0-patched-image-overlap/grill-evidence-v1.tgz
 85e866169871e890dd3824179f7ac6c825cdb78aadfcba8ff398f277d72fc631  tensorfold-1.1.0-stock-vs-recipe/grill-evidence-c4.tgz
 fdad16d37c36a05d7744834aba83570baa1ee11264c465bf02439b84e67c85e9  tensorfold-1.1.0-stock-vs-recipe/grill-evidence-c8.tgz
 a5ec4b142e785ec06979e35bffd932e0a44b7604fda670488fa6b27ff45d29d4  tensorfold-1.1.0-stock-vs-recipe/grill-evidence-v1.tgz
