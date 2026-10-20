@@ -37,7 +37,7 @@ This repository is scripts and patches. Almost everything that makes it work was
   [#1002](https://github.com/ashhart/TensorFold/pull/1002), [#1006](https://github.com/ashhart/TensorFold/pull/1006),
   [#1008](https://github.com/ashhart/TensorFold/pull/1008), [#1011](https://github.com/ashhart/TensorFold/pull/1011)),
   with the maintainer's follow-ups, under TensorFold's Apache 2.0 license.
-- The `.patch` files in `patches/` are by plotarmordev: changes to TensorFold v1.1.0's Nemotron CUDA engine, each
+- The `.patch` files in `patches/` are by plotarmordev: changes to TensorFold v1.1.1's Nemotron CUDA engine, each
   also an upstream pull request ([`patches/PATCHES.md`](patches/PATCHES.md)), under TensorFold's Apache 2.0 license.
 
 ## Toolchain and runtime

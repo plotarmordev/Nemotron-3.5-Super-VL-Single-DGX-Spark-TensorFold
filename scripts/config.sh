@@ -19,9 +19,9 @@ fi
 # together, here.
 MODEL_REPO=nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4
 MODEL_REVISION=82d93699acd3be9e4617c53360fe5b3f5dbeb1b3
-TF_VERSION=1.1.0
-TF_SHA256=8f18033fca9df0c56c19afb2f11b55175151ff886c2603b01c0390bf48773e59   # the release archive
-TF_COMMIT=76aafcf274e60a5e31a59ce145b2f71f7b366e9d                           # what tag v$TF_VERSION must point at
+TF_VERSION=1.1.1
+TF_SHA256=2e0103a544e64354bfec65bd8a052ede17aa9be1f6a56d8e37c868af9139cb39   # the release archive
+TF_COMMIT=b10231b94f8adf3d4132acebdc0a1ac87e53a838                           # what tag v$TF_VERSION must point at
 ZIG_VERSION=0.17.0
 ZIG_SHA256=9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234ff8   # zig-aarch64-linux-$ZIG_VERSION.tar.xz
 

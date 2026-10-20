@@ -1,4 +1,4 @@
-From b5bf0c400f9977b03c9553ecc3e39ed8846f365f Mon Sep 17 00:00:00 2001
+From 13f267365248f42783f1b7c01407f9a62e8dfb5a Mon Sep 17 00:00:00 2001
 From: plotarmordev <299844489+plotarmordev@users.noreply.github.com>
 Date: Mon, 19 Oct 2026 14:10:40 +0800
 Subject: [PATCH 1/2] nemotron cuda: a prompt pass with images runs the RADIO
@@ -12,7 +12,7 @@ encodes every image again, so each image request ran the tower twice before its 
  1 file changed, 2 deletions(-)
 
 diff --git a/zig/src/families/nemotron/cuda_lanes.zig b/zig/src/families/nemotron/cuda_lanes.zig
-index 5ef428eb..3888dd2d 100644
+index 1479ab00..492846b3 100644
 --- a/zig/src/families/nemotron/cuda_lanes.zig
 +++ b/zig/src/families/nemotron/cuda_lanes.zig
 @@ -309,8 +309,6 @@ pub const Cuda = struct {

@@ -1,4 +1,4 @@
-From 951b6b3b519ced175fd06d47eb54d00e7c8e5a43 Mon Sep 17 00:00:00 2001
+From 7079dda951bca0bc7f09b9238171d3448476b300 Mon Sep 17 00:00:00 2001
 From: plotarmordev <299844489+plotarmordev@users.noreply.github.com>
 Date: Sun, 18 Oct 2026 20:26:20 +0800
 Subject: [PATCH 2/2] nemotron cuda: shared windows of several sequences run
@@ -53,7 +53,7 @@ index 38ea543d..7801dc5e 100644
      f.c.latent = 0;
      try std.testing.expect(f.routedWindow(&parts).side != null);
 diff --git a/zig/src/families/nemotron/cuda.zig b/zig/src/families/nemotron/cuda.zig
-index c221b283..2a8c19a4 100644
+index 4c8667fe..509ceb15 100644
 --- a/zig/src/families/nemotron/cuda.zig
 +++ b/zig/src/families/nemotron/cuda.zig
 @@ -7,6 +7,7 @@ pub const weights = @import("cuda_weights.zig");
@@ -65,7 +65,7 @@ index c221b283..2a8c19a4 100644
  pub const Marks = @import("cuda_forward.zig").Marks;
  pub const Class = @import("cuda_forward.zig").Class;
 diff --git a/zig/src/families/nemotron/cuda_forward.zig b/zig/src/families/nemotron/cuda_forward.zig
-index 6859cb47..2375e7ac 100644
+index 03cc9ae2..9bd63a90 100644
 --- a/zig/src/families/nemotron/cuda_forward.zig
 +++ b/zig/src/families/nemotron/cuda_forward.zig
 @@ -140,7 +140,7 @@ pub const Forward = struct {
@@ -78,10 +78,10 @@ index 6859cb47..2375e7ac 100644
              if (s.untaught) break true;
          } else false;
 diff --git a/zig/tests/cuda/main.zig b/zig/tests/cuda/main.zig
-index 6f984ad7..3bf4ded7 100644
+index 837f1bb0..34015810 100644
 --- a/zig/tests/cuda/main.zig
 +++ b/zig/tests/cuda/main.zig
-@@ -134,7 +134,7 @@ const usage =
+@@ -156,7 +156,7 @@ const usage =
      \\  prompt-cuts MODEL IDS_FILE   a prompt keeping states inside chunks and at their ends (background passes too), and resumed from each, equals one uncut pass
      \\  prompt-segments MODEL IDS_FILE   a prompt run as 2 to 4 staggered segments a call equals one uncut pass, byte for byte
      \\  cached-plans-tp2 MODEL IDS_FILE   rank-zero cached plans and prompt resumes with the existing expert rank
