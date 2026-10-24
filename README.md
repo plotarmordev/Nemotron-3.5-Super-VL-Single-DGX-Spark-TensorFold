@@ -15,7 +15,7 @@ This recipe serves Nemotron 3.5 Super VL from NVIDIA's NVFP4 checkpoint with sto
 recipe used to patch in: the 16 that came with 1.1.0 and the 2 it carried on 1.1.0 (an image prompt runs the image
 tower once per image, not twice, and several requests at once run the shared expert on the side stream again). On
 1.1.3, `tools/bench.py decode`'s 12 replies, an image prompt among them, were token for token the same as on the
-previous build (1.1.0 with those 2 patches), which matched stock 1.0.12 and 1.1.0 in every check we ran. The speed
+previous build (1.1.0 with those 2 patches), which matched stock 1.0.12 and 1.1.0 in every check I ran. The speed
 numbers below were measured on the previous build and not re-measured on 1.1.3. The weights are not in this
 repository: you download them from
 [Hugging Face](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4).
@@ -41,11 +41,11 @@ once from 1.1.0's.
 | | Stock TensorFold 1.0.12 | 1.1.0 + 2 patches | Stock again |
 |---|---:|---:|---:|
 | 1 at a time, median tok/s (8 runs each) | 71.5 | **95.1** | 74.0 |
-| Change | | **+28%** ![Measured faster](https://img.shields.io/badge/measured_faster-1a7f37?style=flat-square) | stock drift +3.4% |
+| Change | | **+28%** | stock drift +3.4% |
 | 4 at once, median combined tok/s | 146.5 | **165.3** | 123.8 |
-| Change | | **+22%** ![Measured faster](https://img.shields.io/badge/measured_faster-1a7f37?style=flat-square) | stock drift −15.5% |
+| Change | | **+22%** | stock drift −15.5% |
 | 8 at once, median combined tok/s | 157.6 | **247.6** | 142.4 |
-| Change | | **+53%** ![Measured faster](https://img.shields.io/badge/measured_faster-1a7f37?style=flat-square) | stock drift −10.7% |
+| Change | | **+53%** | stock drift −10.7% |
 
 Every reply in all three deployments was the same text: 24 one at a time, 96 at 4 at once, 192 at 8 at once, and
 the warm-ups (8, 32 and 64).

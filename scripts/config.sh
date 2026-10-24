@@ -59,7 +59,7 @@ UNIT="${UNIT:-nemotron-super-vl}"         # the server's systemd user unit
 STOP_TIMEOUT="${STOP_TIMEOUT:-30}"        # seconds the server gets after SIGTERM before SIGKILL (set at start)
 RUNTIME_MAX="${RUNTIME_MAX:-infinity}"    # wall-clock limit on the server's life (systemd RuntimeMaxSec)
 # Memory available at start known to be enough for all 8 streams and the full prompt cache (starts from 116 and 109
-# GiB both kept them); see README, Memory.
+# GiB both kept them, measured on stock 1.1.0, not re-measured on 1.1.3); see README, Memory.
 MIN_FREE_GIB="${MIN_FREE_GIB:-115}"
 STATE_DIR="${STATE_DIR:-$HOME/.cache/nemotron-super-vl-spark}"   # locks, what prepare.sh left
 
