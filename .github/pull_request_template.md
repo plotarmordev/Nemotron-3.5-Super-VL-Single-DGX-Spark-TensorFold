@@ -1,12 +1,11 @@
 ## What this changes
 
-<!-- What changes and why. For a setting, default, patch or engine release: what it does to memory, speed or replies. -->
+<!-- What changes and why. For a setting, default or engine release: what it does to memory, speed or replies. -->
 
 ## Testing
 
 <!--
-How you verified it, e.g. `shellcheck` on changed scripts. A change to patches/: `tools/bench.py decode` output from
-main and from this pull request (CONTRIBUTING.md, Engine changes).
+How you verified it, e.g. `shellcheck` on changed scripts.
 -->
 
 ## Performance claim
@@ -21,7 +20,5 @@ None.
 
 ## Checklist
 
-- [ ] Script, setting, patch or release changes: `./start.sh` at the defaults and `tools/smoke.py` pass on a DGX Spark.
-- [ ] A change to `patches/` keeps every `token_sha256` the same as `main`'s, and `patches/PATCHES.md` links each
-  patch's upstream pull request.
+- [ ] Script, setting or release changes: `./start.sh` at the defaults and `tools/smoke.py` pass on a DGX Spark.
 - [ ] The README and `scripts/config.sh` match any setting or default I changed.
