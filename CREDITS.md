@@ -1,6 +1,6 @@
 # Credits
 
-This repository is scripts and patches. Almost everything that makes it work was built by others.
+This repository is scripts. Almost everything that makes it work was built by others.
 
 ## Recipe design
 
@@ -36,14 +36,12 @@ This repository is scripts and patches. Almost everything that makes it work was
   [#997](https://github.com/ashhart/TensorFold/pull/997), [#999](https://github.com/ashhart/TensorFold/pull/999),
   [#1002](https://github.com/ashhart/TensorFold/pull/1002), [#1006](https://github.com/ashhart/TensorFold/pull/1006),
   [#1008](https://github.com/ashhart/TensorFold/pull/1008), [#1011](https://github.com/ashhart/TensorFold/pull/1011)),
-  with the maintainer's follow-ups, under TensorFold's Apache 2.0 license.
-- The `.patch` files in `patches/` are by plotarmordev: changes to TensorFold v1.1.0's Nemotron CUDA engine, each
-  also an upstream pull request ([`patches/PATCHES.md`](patches/PATCHES.md)), under TensorFold's Apache 2.0 license.
+  with the maintainer's follow-ups, and in TensorFold 1.1.3 ([#1057](https://github.com/ashhart/TensorFold/pull/1057)
+  and [#1058](https://github.com/ashhart/TensorFold/pull/1058), landed by the maintainer as `6bdcd3891` and
+  `fadbf9a45`), under TensorFold's Apache 2.0 license.
 
-## Toolchain and runtime
+## Runtime
 
-- **[Zig](https://ziglang.org/)** (MIT) 0.17.0 and **[CUDA](https://developer.nvidia.com/cuda-toolkit)** 13's
-  `nvcc` (NVIDIA's license terms): building the patched engine from source.
 - **[systemd](https://systemd.io/)** (LGPL 2.1): the user unit the server runs in.
 
 ## Hardware
